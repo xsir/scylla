@@ -1,0 +1,80 @@
+#!/bin/sh
+
+print_usage() {
+    echo "scylla_io_setup --ami"
+    echo "  --ami				setup AMI instance"
+    exit 1
+}
+
+AMI_OPT=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        "--ami")
+            AMI_OPT=1
+            shift 1
+            ;;
+        *)
+            print_usage
+            ;;
+    esac
+done
+
+
+is_developer_mode() {
+    cat /etc/scylla.d/dev-mode.conf|egrep -c "\-\-developer-mode(\s+|=)(1|true)"
+}
+
+output_to_user()
+{
+    echo "$1"
+    logger -p user.err "$1"
+}
+
+. /etc/os-release
+if [ "$NAME" = "Ubuntu" ]; then
+   . /etc/default/scylla-server
+else
+   . /etc/sysconfig/scylla-server
+fi
+
+if [ `is_developer_mode` -eq 0 ]; then
+    SMP=`echo $SCYLLA_ARGS|grep smp|sed -e "s/^.*smp\(\s\+\|=\)\([0-9]*\).*$/\2/"`
+    CPUSET=`echo $SCYLLA_ARGS|grep cpuset|sed -e "s/^.*\(--cpuset\(\s\+\|=\)[0-9\-]*\).*$/\1/"`
+    if [ $AMI_OPT -eq 1 ]; then
+        NR_CPU=`cat /proc/cpuinfo |grep processor|wc -l`
+        NR_DISKS=`lsblk --list --nodeps --noheadings | grep -v xvda | grep xvd | wc -l`
+        TYPE=`curl http://169.254.169.254/latest/meta-data/instance-type|cut -d . -f 1`
+
+        if [ "$SMP" != "" ]; then
+            NR_CPU=$SMP
+        fi
+        NR_SHARDS=$NR_CPU
+        if [ $NR_CPU -ge 8 ] && [ "$SET_NIC" = "no" ]; then
+            NR_SHARDS=$((NR_CPU - 1))
+        fi
+        if [ $NR_DISKS -lt 2 ]; then NR_DISKS=2; fi
+
+        NR_REQS=$((32 * $NR_DISKS / 2))
+
+        NR_IO_QUEUES=$NR_SHARDS
+        if [ $(($NR_REQS/$NR_IO_QUEUES)) -lt 4 ]; then
+            NR_IO_QUEUES=$(($NR_REQS / 4))
+        fi
+
+        NR_IO_QUEUES=$((NR_IO_QUEUES>NR_SHARDS?NR_SHARDS:NR_IO_QUEUES))
+        NR_REQS=$(($(($NR_REQS / $NR_IO_QUEUES)) * $NR_IO_QUEUES))
+        if [ "$TYPE" = "i2" ]; then
+            NR_REQS=$(($NR_REQS * 2))
+        fi
+
+        echo "SEASTAR_IO=\"--num-io-queues $NR_IO_QUEUES --max-io-requests $NR_REQS\"" > /etc/scylla.d/io.conf
+    else
+        iotune --evaluation-directory /var/lib/scylla --format envfile --options-file /etc/scylla.d/io.conf $CPUSET
+        if [ $? -ne 0 ]; then
+            output_to_user "/var/lib/scylla did not pass validation tests, it may not be on XFS and/or has limited disk space."
+            output_to_user "This is a non-supported setup, and performance is expected to be very bad."
+            output_to_user "For better performance, placing your data on XFS-formatted directories is required."
+            output_to_user " To override this error, see the developer_mode configuration option."
+        fi
+    fi
+fi

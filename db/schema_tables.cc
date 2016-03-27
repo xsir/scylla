@@ -65,6 +65,7 @@
 #include <boost/range/adaptor/map.hpp>
 
 #include "compaction_strategy.hh"
+#include "utils/joinpoint.hh"
 
 using namespace db::system_keyspace;
 
@@ -415,16 +416,16 @@ future<std::vector<frozen_mutation>> convert_schema_to_mutations(distributed<ser
                 if (partition_key == system_keyspace::NAME) {
                     continue;
                 }
-                results.emplace_back(p.mut());
+                results.emplace_back(std::move(p.mut()));
             }
             return results;
         });
     };
     auto reduce = [] (auto&& result, auto&& mutations) {
-        std::copy(mutations.begin(), mutations.end(), std::back_inserter(result));
+        std::move(mutations.begin(), mutations.end(), std::back_inserter(result));
         return std::move(result);
     };
-    return map_reduce(ALL.begin(), ALL.end(), map, std::move(std::vector<frozen_mutation>{}), reduce);
+    return map_reduce(ALL.begin(), ALL.end(), map, std::vector<frozen_mutation>{}, reduce);
 }
 
 future<schema_result>
@@ -606,10 +607,10 @@ future<> do_merge_schema(distributed<service::storage_proxy>& proxy, std::vector
 #endif
        proxy.local().get_db().invoke_on_all([keyspaces_to_drop = std::move(keyspaces_to_drop)] (database& db) {
            // it is safe to drop a keyspace only when all nested ColumnFamilies where deleted
-           for (auto&& keyspace_to_drop : keyspaces_to_drop) {
+           return do_for_each(keyspaces_to_drop, [&db] (auto keyspace_to_drop) {
                db.drop_keyspace(keyspace_to_drop);
-               service::get_local_migration_manager().notify_drop_keyspace(keyspace_to_drop);
-           }
+               return service::get_local_migration_manager().notify_drop_keyspace(keyspace_to_drop);
+            });
        }).get0();
    });
 }
@@ -649,7 +650,7 @@ future<std::set<sstring>> merge_keyspaces(distributed<service::storage_proxy>& p
             return do_for_each(created, [&db](auto&& val) {
                 auto ksm = create_keyspace_from_schema_partition(val);
                 return db.create_keyspace(ksm).then([ksm] {
-                    service::get_local_migration_manager().notify_create_keyspace(ksm);
+                    return service::get_local_migration_manager().notify_create_keyspace(ksm);
                 });
             }).then([&altered, &db] () mutable {
                 for (auto&& name : altered) {
@@ -662,7 +663,7 @@ future<std::set<sstring>> merge_keyspaces(distributed<service::storage_proxy>& p
     });
 }
 
-static void update_column_family(database& db, schema_ptr new_schema) {
+static future<> update_column_family(database& db, schema_ptr new_schema) {
     column_family& cfm = db.find_column_family(new_schema->id());
 
     bool columns_changed = !cfm.schema()->equal_columns(*new_schema);
@@ -671,7 +672,7 @@ static void update_column_family(database& db, schema_ptr new_schema) {
     s->registry_entry()->mark_synced();
     cfm.set_schema(std::move(s));
 
-    service::get_local_migration_manager().notify_update_column_family(cfm.schema(), columns_changed);
+    return service::get_local_migration_manager().notify_update_column_family(cfm.schema(), columns_changed);
 }
 
 // see the comments for merge_keyspaces()
@@ -679,7 +680,6 @@ static void merge_tables(distributed<service::storage_proxy>& proxy,
     std::map<qualified_name, schema_mutations>&& before,
     std::map<qualified_name, schema_mutations>&& after)
 {
-    auto changed_at = db_clock::now();
     std::vector<global_schema_ptr> created;
     std::vector<global_schema_ptr> altered;
     std::vector<global_schema_ptr> dropped;
@@ -687,34 +687,44 @@ static void merge_tables(distributed<service::storage_proxy>& proxy,
     auto diff = difference(before, after);
     for (auto&& key : diff.entries_only_on_left) {
         auto&& s = proxy.local().get_db().local().find_schema(key.keyspace_name, key.table_name);
+        logger.info("Dropping {}.{} id={} version={}", s->ks_name(), s->cf_name(), s->id(), s->version());
         dropped.emplace_back(s);
     }
     for (auto&& key : diff.entries_only_on_right) {
-        created.emplace_back(create_table_from_mutations(after.at(key)));
+        auto s = create_table_from_mutations(after.at(key));
+        logger.info("Creating {}.{} id={} version={}", s->ks_name(), s->cf_name(), s->id(), s->version());
+        created.emplace_back(s);
     }
     for (auto&& key : diff.entries_differing) {
-        altered.emplace_back(create_table_from_mutations(after.at(key)));
+        auto s = create_table_from_mutations(after.at(key));
+        logger.info("Altering {}.{} id={} version={}", s->ks_name(), s->cf_name(), s->id(), s->version());
+        altered.emplace_back(s);
     }
 
-    proxy.local().get_db().invoke_on_all([&created, &dropped, &altered, changed_at] (database& db) {
-        return seastar::async([&] {
-            for (auto&& gs : created) {
-                schema_ptr s = gs.get();
-                auto& ks = db.find_keyspace(s->ks_name());
-                auto cfg = ks.make_column_family_config(*s);
-                db.add_column_family(s, cfg);
-                ks.make_directory_for_column_family(s->cf_name(), s->id()).get();
-                service::get_local_migration_manager().notify_create_column_family(s);
-            }
-            for (auto&& gs : altered) {
-                update_column_family(db, gs.get());
-            }
-            parallel_for_each(dropped.begin(), dropped.end(), [changed_at, &db](auto&& gs) {
-                schema_ptr s = gs.get();
-                return db.drop_column_family(changed_at, s->ks_name(), s->cf_name()).then([s] {
-                    service::get_local_migration_manager().notify_drop_column_family(s);
-                });
-            }).get();
+    do_with(utils::make_joinpoint([] { return db_clock::now();})
+        , [&created, &dropped, &altered, &proxy](auto& tsf) {
+        return proxy.local().get_db().invoke_on_all([&created, &dropped, &altered, &tsf] (database& db) {
+            return seastar::async([&] {
+                for (auto&& gs : created) {
+                    schema_ptr s = gs.get();
+                    auto& ks = db.find_keyspace(s->ks_name());
+                    auto cfg = ks.make_column_family_config(*s);
+                    db.add_column_family(s, cfg);
+                    auto& cf = db.find_column_family(s);
+                    cf.mark_ready_for_writes();
+                    ks.make_directory_for_column_family(s->cf_name(), s->id()).get();
+                    service::get_local_migration_manager().notify_create_column_family(s).get();
+                }
+                for (auto&& gs : altered) {
+                    update_column_family(db, gs.get()).get();
+                }
+                parallel_for_each(dropped.begin(), dropped.end(), [&db, &tsf](auto&& gs) {
+                    schema_ptr s = gs.get();
+                    return db.drop_column_family(s->ks_name(), s->cf_name(), [&tsf] { return tsf.value(); }).then([s] {
+                        return service::get_local_migration_manager().notify_drop_column_family(s);
+                    });
+                }).get();
+            });
         });
     }).get();
 }

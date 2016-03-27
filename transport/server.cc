@@ -191,7 +191,7 @@ public:
     void write_byte(uint8_t b);
     void write_int(int32_t n);
     void write_long(int64_t n);
-    void write_short(int16_t n);
+    void write_short(uint16_t n);
     void write_string(const sstring& s);
     void write_long_string(const sstring& s);
     void write_uuid(utils::UUID uuid);
@@ -275,7 +275,7 @@ future<> cql_server::stop() {
 }
 
 future<>
-cql_server::listen(ipv4_addr addr, ::shared_ptr<seastar::tls::server_credentials> creds) {
+cql_server::listen(ipv4_addr addr, ::shared_ptr<seastar::tls::server_credentials> creds, bool keepalive) {
     _notifier = std::make_unique<event_notifier>(addr.port);
     service::get_local_migration_manager().register_listener(_notifier.get());
     service::get_local_storage_service().register_subscriber(_notifier.get());
@@ -286,14 +286,14 @@ cql_server::listen(ipv4_addr addr, ::shared_ptr<seastar::tls::server_credentials
                     ? seastar::tls::listen(creds, make_ipv4_address(addr), lo)
                     : engine().listen(make_ipv4_address(addr), lo);
     _listeners.emplace_back(std::move(ss));
-    _stopped = when_all(std::move(_stopped), do_accepts(_listeners.size() - 1)).discard_result();
+    _stopped = when_all(std::move(_stopped), do_accepts(_listeners.size() - 1, keepalive)).discard_result();
     return make_ready_future<>();
 }
 
 future<>
-cql_server::do_accepts(int which) {
+cql_server::do_accepts(int which, bool keepalive) {
     ++_connections_being_accepted;
-    return _listeners[which].accept().then_wrapped([this, which] (future<connected_socket, socket_address> f_cs_sa) mutable {
+    return _listeners[which].accept().then_wrapped([this, which, keepalive] (future<connected_socket, socket_address> f_cs_sa) mutable {
         --_connections_being_accepted;
         if (_stopping) {
             f_cs_sa.ignore_ready_future();
@@ -304,6 +304,7 @@ cql_server::do_accepts(int which) {
         auto fd = std::get<0>(std::move(cs_sa));
         auto addr = std::get<1>(std::move(cs_sa));
         fd.set_nodelay(true);
+        fd.set_keepalive(keepalive);
         auto conn = make_shared<connection>(*this, std::move(fd), std::move(addr));
         ++_connects;
         ++_connections;
@@ -315,7 +316,7 @@ cql_server::do_accepts(int which) {
                 logger.debug("connection error: {}", std::current_exception());
             }
         });
-        do_accepts(which);
+        do_accepts(which, keepalive);
     }).then_wrapped([] (future<> f) {
         try {
             f.get();
@@ -378,7 +379,7 @@ cql_server::connection::read_frame() {
                 return make_ready_future<ret_type>();
             }
             _version = buf[0];
-            init_serialization_format();
+            init_cql_serialization_format();
             if (_version < 1 || _version > current_version) {
                 auto client_version = _version;
                 _version = current_version;
@@ -536,8 +537,6 @@ future<> cql_server::connection::process()
 future<> cql_server::connection::shutdown()
 {
     return _fd.shutdown_input().then([this] {
-        return _pending_requests_gate.close();
-    }).then([this] {
         return _fd.shutdown_output();
     });
 }
@@ -637,12 +636,8 @@ future<response_type> cql_server::connection::process_options(uint16_t stream, b
 }
 
 void
-cql_server::connection::init_serialization_format() {
-    if (_version < 3) {
-        _serialization_format = serialization_format::use_16_bit();
-    } else {
-        _serialization_format = serialization_format::use_32_bit();
-    }
+cql_server::connection::init_cql_serialization_format() {
+    _cql_serialization_format = cql_serialization_format(_version);
 }
 
 future<response_type> cql_server::connection::process_query(uint16_t stream, bytes_view buf, service::client_state client_state)
@@ -718,7 +713,7 @@ cql_server::connection::process_batch(uint16_t stream, bytes_view buf, service::
     }
 
     const auto type = read_byte(buf);
-    const unsigned n = read_unsigned_short(buf);
+    const unsigned n = read_short(buf);
 
     std::vector<shared_ptr<cql3::statements::modification_statement>> modifications;
     std::vector<std::vector<bytes_view_opt>> values;
@@ -770,7 +765,8 @@ cql_server::connection::process_batch(uint16_t stream, bytes_view buf, service::
 
     auto q_state = std::make_unique<cql_query_state>(client_state);
     auto& query_state = q_state->query_state;
-    q_state->options = std::make_unique<cql3::query_options>(std::move(*read_options(buf)), std::move(values));
+    // #563. CQL v2 encodes query_options in v1 format for batch requests.
+    q_state->options = std::make_unique<cql3::query_options>(std::move(*read_options(buf, _version < 3 ? 1 : _version)), std::move(values));
     auto& options = *q_state->options;
 
     auto batch = ::make_shared<cql3::statements::batch_statement>(-1, cql3::statements::batch_statement::type(type), std::move(modifications), cql3::attributes::none());
@@ -915,12 +911,9 @@ public:
         _response->write_short_bytes(m.get_id());
         // FIXME: not compatible with v4
         assert(_version < 4);
-        cql3::metadata metadata{prepared->bound_names};
-        _response->write(metadata);
+        _response->write(*m.metadata());
         if (_version > 1) {
-            cql3::metadata result_metadata{std::vector<::shared_ptr<cql3::column_specification>>{}};
-            result_metadata.set_skip_metadata();
-            _response->write(result_metadata);
+            _response->write(*m.result_metadata());
         }
     }
 
@@ -1053,12 +1046,7 @@ int64_t cql_server::connection::read_long(bytes_view& buf)
     return n;
 }
 
-int16_t cql_server::connection::read_short(bytes_view& buf)
-{
-    return static_cast<int16_t>(read_unsigned_short(buf));
-}
-
-uint16_t cql_server::connection::read_unsigned_short(bytes_view& buf)
+uint16_t cql_server::connection::read_short(bytes_view& buf)
 {
     check_room(buf, sizeof(uint16_t));
     auto p = reinterpret_cast<const uint8_t*>(buf.begin());
@@ -1151,13 +1139,18 @@ using options_flag_enum = super_enum<options_flag,
 
 std::unique_ptr<cql3::query_options> cql_server::connection::read_options(bytes_view& buf)
 {
+    return read_options(buf, _version);
+}
+
+std::unique_ptr<cql3::query_options> cql_server::connection::read_options(bytes_view& buf, uint8_t version)
+{
     auto consistency = read_consistency(buf);
-    if (_version == 1) {
+    if (version == 1) {
         return std::make_unique<cql3::query_options>(consistency, std::experimental::nullopt, std::vector<bytes_view_opt>{},
-            false, cql3::query_options::specific_options::DEFAULT, 1, _serialization_format);
+            false, cql3::query_options::specific_options::DEFAULT, _cql_serialization_format);
     }
 
-    assert(_version >= 2);
+    assert(version >= 2);
 
     auto flags = enum_set<options_flag_enum>::from_mask(read_byte(buf));
     std::vector<bytes_view_opt> values;
@@ -1202,18 +1195,18 @@ std::unique_ptr<cql3::query_options> cql_server::connection::read_options(bytes_
             onames = std::move(names);
         }
         options = std::make_unique<cql3::query_options>(consistency, std::move(onames), std::move(values), skip_metadata,
-            cql3::query_options::specific_options{page_size, std::move(paging_state), serial_consistency, ts}, _version,
-            _serialization_format);
+            cql3::query_options::specific_options{page_size, std::move(paging_state), serial_consistency, ts},
+            _cql_serialization_format);
     } else {
         options = std::make_unique<cql3::query_options>(consistency, std::experimental::nullopt, std::move(values), skip_metadata,
-            cql3::query_options::specific_options::DEFAULT, _version, _serialization_format);
+            cql3::query_options::specific_options::DEFAULT, _cql_serialization_format);
     }
 
     return std::move(options);
 }
 
 void cql_server::connection::read_name_and_value_list(bytes_view& buf, std::vector<sstring_view>& names, std::vector<bytes_view_opt>& values) {
-    uint16_t size = read_unsigned_short(buf);
+    uint16_t size = read_short(buf);
     names.reserve(size);
     values.reserve(size);
     for (uint16_t i = 0; i < size; i++) {
@@ -1223,7 +1216,7 @@ void cql_server::connection::read_name_and_value_list(bytes_view& buf, std::vect
 }
 
 void cql_server::connection::read_string_list(bytes_view& buf, std::vector<sstring>& strings) {
-    uint16_t size = read_unsigned_short(buf);
+    uint16_t size = read_short(buf);
     strings.reserve(size);
     for (uint16_t i = 0; i < size; i++) {
         strings.emplace_back(read_string(buf));
@@ -1231,7 +1224,7 @@ void cql_server::connection::read_string_list(bytes_view& buf, std::vector<sstri
 }
 
 void cql_server::connection::read_value_view_list(bytes_view& buf, std::vector<bytes_view_opt>& values) {
-    uint16_t size = read_unsigned_short(buf);
+    uint16_t size = read_short(buf);
     values.reserve(size);
     for (uint16_t i = 0; i < size; i++) {
         values.emplace_back(read_value_view(buf));
@@ -1357,24 +1350,32 @@ void cql_server::response::write_long(int64_t n)
     _body.insert(_body.end(), s, s+sizeof(u));
 }
 
-void cql_server::response::write_short(int16_t n)
+void cql_server::response::write_short(uint16_t n)
 {
     auto u = htons(n);
     auto *s = reinterpret_cast<const char*>(&u);
     _body.insert(_body.end(), s, s+sizeof(u));
 }
 
+template<typename T>
+inline
+T cast_if_fits(size_t v) {
+    size_t max = std::numeric_limits<T>::max();
+    if (v > max) {
+        throw std::runtime_error(sprint("Value too large, %d > %d", v, max));
+    }
+    return static_cast<T>(v);
+}
+
 void cql_server::response::write_string(const sstring& s)
 {
-    assert(s.size() < std::numeric_limits<int16_t>::max());
-    write_short(s.size());
+    write_short(cast_if_fits<uint16_t>(s.size()));
     _body.insert(_body.end(), s.begin(), s.end());
 }
 
 void cql_server::response::write_long_string(const sstring& s)
 {
-    assert(s.size() < std::numeric_limits<int32_t>::max());
-    write_int(s.size());
+    write_int(cast_if_fits<int32_t>(s.size()));
     _body.insert(_body.end(), s.begin(), s.end());
 }
 
@@ -1386,8 +1387,7 @@ void cql_server::response::write_uuid(utils::UUID uuid)
 
 void cql_server::response::write_string_list(std::vector<sstring> string_list)
 {
-    assert(string_list.size() < std::numeric_limits<int16_t>::max());
-    write_short(string_list.size());
+    write_short(cast_if_fits<uint16_t>(string_list.size()));
     for (auto&& s : string_list) {
         write_string(s);
     }
@@ -1395,15 +1395,13 @@ void cql_server::response::write_string_list(std::vector<sstring> string_list)
 
 void cql_server::response::write_bytes(bytes b)
 {
-    assert(b.size() < std::numeric_limits<int32_t>::max());
-    write_int(b.size());
+    write_int(cast_if_fits<int32_t>(b.size()));
     _body.insert(_body.end(), b.begin(), b.end());
 }
 
 void cql_server::response::write_short_bytes(bytes b)
 {
-    assert(b.size() < std::numeric_limits<int16_t>::max());
-    write_short(b.size());
+    write_short(cast_if_fits<uint16_t>(b.size()));
     _body.insert(_body.end(), b.begin(), b.end());
 }
 
@@ -1436,8 +1434,7 @@ void cql_server::response::write_consistency(db::consistency_level c)
 
 void cql_server::response::write_string_map(std::map<sstring, sstring> string_map)
 {
-    assert(string_map.size() < std::numeric_limits<int16_t>::max());
-    write_short(string_map.size());
+    write_short(cast_if_fits<uint16_t>(string_map.size()));
     for (auto&& s : string_map) {
         write_string(s.first);
         write_string(s.second);
@@ -1450,8 +1447,7 @@ void cql_server::response::write_string_multimap(std::multimap<sstring, sstring>
     for (auto it = string_map.begin(), end = string_map.end(); it != end; it = string_map.upper_bound(it->first)) {
         keys.push_back(it->first);
     }
-    assert(keys.size() < std::numeric_limits<int16_t>::max());
-    write_short(keys.size());
+    write_short(cast_if_fits<uint16_t>(keys.size()));
     for (auto&& key : keys) {
         std::vector<sstring> values;
         auto range = string_map.equal_range(key);

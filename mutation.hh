@@ -60,9 +60,9 @@ public:
     mutation(const mutation& m)
         : _ptr(std::make_unique<data>(schema_ptr(m.schema()), dht::decorated_key(m.decorated_key()), m.partition()))
     { }
-
     mutation(mutation&&) = default;
     mutation& operator=(mutation&& x) = default;
+    mutation& operator=(const mutation& m);
 
     void set_static_cell(const column_definition& def, atomic_cell_or_collection&& value);
     void set_static_cell(const bytes& name, const data_value& value, api::timestamp_type timestamp, ttl_opt ttl = {});
@@ -104,7 +104,8 @@ public:
     bool operator!=(const mutation&) const;
 public:
     // The supplied partition_slice must be governed by this mutation's schema
-    query::result query(const query::partition_slice&, gc_clock::time_point now = gc_clock::now(), uint32_t row_limit = query::max_rows) const;
+    query::result query(const query::partition_slice&, query::result_request request = query::result_request::only_result,
+        gc_clock::time_point now = gc_clock::now(), uint32_t row_limit = query::max_rows) const;
 
     // See mutation_partition::live_row_count()
     size_t live_row_count(gc_clock::time_point query_time = gc_clock::time_point::min()) const;

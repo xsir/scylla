@@ -48,19 +48,28 @@
 #include <core/align.hh>
 #include "utils/phased_barrier.hh"
 
+#include "checked-file-impl.hh"
+#include "disk-error-handler.hh"
+
+thread_local disk_error_signal_type sstable_read_error;
+thread_local disk_error_signal_type sstable_write_error;
+
 namespace sstables {
 
 logging::logger sstlog("sstable");
 
-thread_local std::unordered_map<sstring, unsigned> sstable::_shards_agreeing_to_remove_sstable;
+future<file> new_sstable_component_file(disk_error_signal_type& signal, sstring name, open_flags flags) {
+    return open_checked_file_dma(signal, name, flags).handle_exception([name] (auto ep) {
+        sstlog.error("Could not create SSTable component {}. Found exception: {}", name, ep);
+        return make_exception_future<file>(ep);
+    });
+}
+
+thread_local std::unordered_map<sstring, std::unordered_set<unsigned>> sstable::_shards_agreeing_to_remove_sstable;
 
 static utils::phased_barrier& background_jobs() {
-    static thread_local lw_shared_ptr<utils::phased_barrier> gate = [] {
-        auto g = make_lw_shared<utils::phased_barrier>();
-        engine().at_exit([] { return await_background_jobs(); });
-        return g;
-    }();
-    return *gate;
+    static thread_local utils::phased_barrier gate;
+    return gate;
 }
 
 future<> await_background_jobs() {
@@ -114,6 +123,7 @@ public:
         return random_access_reader::close().then([this] {
             return _file.close().handle_exception([save = _file] (auto ep) {
                 sstlog.warn("sstable close failed: {}", ep);
+                general_disk_error();
             });
         });
     }
@@ -128,18 +138,21 @@ std::unordered_map<sstable::format_types, sstring, enum_hash<sstable::format_typ
     { sstable::format_types::big , "big" }
 };
 
+static const sstring TOC_SUFFIX = "TOC.txt";
+static const sstring TEMPORARY_TOC_SUFFIX = "TOC.txt.tmp";
+
 // FIXME: this should be version-dependent
 std::unordered_map<sstable::component_type, sstring, enum_hash<sstable::component_type>> sstable::_component_map = {
     { component_type::Index, "Index.db"},
     { component_type::CompressionInfo, "CompressionInfo.db" },
     { component_type::Data, "Data.db" },
-    { component_type::TOC, "TOC.txt" },
+    { component_type::TOC, TOC_SUFFIX },
     { component_type::Summary, "Summary.db" },
     { component_type::Digest, "Digest.sha1" },
     { component_type::CRC, "CRC.db" },
     { component_type::Filter, "Filter.db" },
     { component_type::Statistics, "Statistics.db" },
-    { component_type::TemporaryTOC, "TOC.txt.tmp" },
+    { component_type::TemporaryTOC, TEMPORARY_TOC_SUFFIX },
 };
 
 // This assumes that the mappings are small enough, and called unfrequent
@@ -680,7 +693,7 @@ future<> sstable::read_toc() {
 
     sstlog.debug("Reading TOC file {} ", file_path);
 
-    return open_file_dma(file_path, open_flags::ro).then([this] (file f) {
+    return open_checked_file_dma(sstable_read_error, file_path, open_flags::ro).then([this] (file f) {
         auto bufptr = allocate_aligned_buffer<char>(4096, 4096);
         auto buf = bufptr.get();
 
@@ -744,16 +757,29 @@ void sstable::generate_toc(compressor c, double filter_fp_chance) {
     }
 }
 
-void sstable::write_toc() {
+void sstable::write_toc(const io_priority_class& pc) {
     auto file_path = filename(sstable::component_type::TemporaryTOC);
 
     sstlog.debug("Writing TOC file {} ", file_path);
 
     // Writing TOC content to temporary file.
-    file f = open_file_dma(file_path, open_flags::wo | open_flags::create | open_flags::truncate).get0();
+    // If creation of temporary TOC failed, it implies that that boot failed to
+    // delete a sstable with temporary for this column family, or there is a
+    // sstable being created in parallel with the same generation.
+    file f = new_sstable_component_file(sstable_write_error, file_path, open_flags::wo | open_flags::create | open_flags::exclusive).get0();
+
+    bool toc_exists = file_exists(filename(sstable::component_type::TOC)).get0();
+    if (toc_exists) {
+        // TOC will exist at this point if write_components() was called with
+        // the generation of a sstable that exists.
+        f.close().get();
+        remove_file(file_path).get();
+        throw std::runtime_error(sprint("SSTable write failed due to existence of TOC file for generation %ld of %s.%s", _generation, _ks, _cf));
+    }
 
     file_output_stream_options options;
     options.buffer_size = 4096;
+    options.io_priority_class = pc;
     auto w = file_writer(std::move(f), std::move(options));
 
     for (auto&& key : _components) {
@@ -767,32 +793,37 @@ void sstable::write_toc() {
 
     // Flushing parent directory to guarantee that temporary TOC file reached
     // the disk.
-    file dir_f = engine().open_directory(_dir).get0();
-    dir_f.flush().get();
-    dir_f.close().get();
+    file dir_f = open_checked_directory(sstable_write_error, _dir).get0();
+    sstable_write_io_check([&] {
+        dir_f.flush().get();
+        dir_f.close().get();
+    });
 }
 
 void sstable::seal_sstable() {
     // SSTable sealing is about renaming temporary TOC file after guaranteeing
     // that each component reached the disk safely.
 
-    file dir_f = engine().open_directory(_dir).get0();
-    // Guarantee that every component of this sstable reached the disk.
-    dir_f.flush().get();
-    // Rename TOC because it's no longer temporary.
-    engine().rename_file(filename(sstable::component_type::TemporaryTOC), filename(sstable::component_type::TOC)).get();
-    // Guarantee that the changes above reached the disk.
-    dir_f.flush().get();
-    dir_f.close().get();
+    file dir_f = open_checked_directory(sstable_write_error, _dir).get0();
+
+    sstable_write_io_check([&] {
+        // Guarantee that every component of this sstable reached the disk.
+        dir_f.flush().get();
+        // Rename TOC because it's no longer temporary.
+        engine().rename_file(filename(sstable::component_type::TemporaryTOC), filename(sstable::component_type::TOC)).get();
+        // Guarantee that the changes above reached the disk.
+        dir_f.flush().get();
+        dir_f.close().get();
+    });
     // If this point was reached, sstable should be safe in disk.
-    sstlog.debug("SSTable with generation {} was sealed successfully.", _generation);
+    sstlog.debug("SSTable with generation {} of {}.{} was sealed successfully.", _generation, _ks, _cf);
 }
 
 void write_crc(const sstring file_path, checksum& c) {
     sstlog.debug("Writing CRC file {} ", file_path);
 
     auto oflags = open_flags::wo | open_flags::create | open_flags::exclusive;
-    file f = open_file_dma(file_path, oflags).get0();
+    file f = new_sstable_component_file(sstable_write_error, file_path, oflags).get0();
 
     file_output_stream_options options;
     options.buffer_size = 4096;
@@ -806,7 +837,7 @@ void write_digest(const sstring file_path, uint32_t full_checksum) {
     sstlog.debug("Writing Digest file {} ", file_path);
 
     auto oflags = open_flags::wo | open_flags::create | open_flags::exclusive;
-    auto f = open_file_dma(file_path, oflags).get0();
+    auto f = new_sstable_component_file(sstable_write_error, file_path, oflags).get0();
 
     file_output_stream_options options;
     options.buffer_size = 4096;
@@ -820,7 +851,7 @@ void write_digest(const sstring file_path, uint32_t full_checksum) {
 thread_local std::array<std::vector<int>, downsampling::BASE_SAMPLING_LEVEL> downsampling::_sample_pattern_cache;
 thread_local std::array<std::vector<int>, downsampling::BASE_SAMPLING_LEVEL> downsampling::_original_index_cache;
 
-future<index_list> sstable::read_indexes(uint64_t summary_idx) {
+future<index_list> sstable::read_indexes(uint64_t summary_idx, const io_priority_class& pc) {
     if (summary_idx >= _summary.header.size) {
         return make_ready_future<index_list>(index_list());
     }
@@ -829,20 +860,20 @@ future<index_list> sstable::read_indexes(uint64_t summary_idx) {
     uint64_t quantity = downsampling::get_effective_index_interval_after_index(summary_idx, _summary.header.sampling_level,
         _summary.header.min_index_interval);
 
-    uint64_t estimated_size;
+    uint64_t end;
     if (++summary_idx >= _summary.header.size) {
-        estimated_size = index_size() - position;
+        end = index_size();
     } else {
-        estimated_size = _summary.entries[summary_idx].position - position;
+        end = _summary.entries[summary_idx].position;
     }
 
-    estimated_size = std::min(uint64_t(sstable_buffer_size), align_up(estimated_size, uint64_t(8 << 10)));
-    estimated_size = std::max<size_t>(estimated_size, 8192);
-
-    return do_with(index_consumer(quantity), [this, position, estimated_size] (index_consumer& ic) {
+    return do_with(index_consumer(quantity), [this, position, end, &pc] (index_consumer& ic) {
         file_input_stream_options options;
-        options.buffer_size = estimated_size;
-        auto stream = make_file_input_stream(this->_index_file, position, std::move(options));
+        options.buffer_size = sstable_buffer_size;
+        options.io_priority_class = pc;
+        auto stream = make_file_input_stream(this->_index_file, position, end - position, std::move(options));
+        // TODO: it's redundant to constrain the consumer here to stop at
+        // index_size()-position, the input stream is already constrained.
         auto ctx = make_lw_shared<index_consume_entry_context>(ic, std::move(stream), this->index_size() - position);
         return ctx->consume_input(*ctx).then([ctx, &ic] {
             return make_ready_future<index_list>(std::move(ic.indexes));
@@ -851,11 +882,12 @@ future<index_list> sstable::read_indexes(uint64_t summary_idx) {
 }
 
 template <sstable::component_type Type, typename T>
-future<> sstable::read_simple(T& component) {
+future<> sstable::read_simple(T& component, const io_priority_class& pc) {
 
     auto file_path = filename(Type);
     sstlog.debug(("Reading " + _component_map[Type] + " file {} ").c_str(), file_path);
-    return open_file_dma(file_path, open_flags::ro).then([this, &component] (file f) {
+    return open_file_dma(file_path, open_flags::ro).then([this, &component] (file fi) {
+        auto f = make_checked_file(sstable_read_error, fi);
         auto r = make_lw_shared<file_random_access_reader>(std::move(f), sstable_buffer_size);
         auto fut = parse(*r, component);
         return fut.finally([r = std::move(r)] {
@@ -873,50 +905,52 @@ future<> sstable::read_simple(T& component) {
 }
 
 template <sstable::component_type Type, typename T>
-void sstable::write_simple(T& component) {
+void sstable::write_simple(T& component, const io_priority_class& pc) {
     auto file_path = filename(Type);
     sstlog.debug(("Writing " + _component_map[Type] + " file {} ").c_str(), file_path);
-    file f = open_file_dma(file_path, open_flags::wo | open_flags::create | open_flags::truncate).get0();
+    file f = new_sstable_component_file(sstable_write_error, file_path, open_flags::wo | open_flags::create | open_flags::exclusive).get0();
 
     file_output_stream_options options;
     options.buffer_size = sstable_buffer_size;
+    options.io_priority_class = pc;
     auto w = file_writer(std::move(f), std::move(options));
     write(w, component);
     w.flush().get();
     w.close().get();
 }
 
-template future<> sstable::read_simple<sstable::component_type::Filter>(sstables::filter& f);
-template void sstable::write_simple<sstable::component_type::Filter>(sstables::filter& f);
+template future<> sstable::read_simple<sstable::component_type::Filter>(sstables::filter& f, const io_priority_class& pc);
+template void sstable::write_simple<sstable::component_type::Filter>(sstables::filter& f, const io_priority_class& pc);
 
-future<> sstable::read_compression() {
+future<> sstable::read_compression(const io_priority_class& pc) {
      // FIXME: If there is no compression, we should expect a CRC file to be present.
     if (!has_component(sstable::component_type::CompressionInfo)) {
         return make_ready_future<>();
     }
 
-    return read_simple<component_type::CompressionInfo>(_compression);
+    return read_simple<component_type::CompressionInfo>(_compression, pc);
 }
 
-void sstable::write_compression() {
+void sstable::write_compression(const io_priority_class& pc) {
     if (!has_component(sstable::component_type::CompressionInfo)) {
         return;
     }
 
-    write_simple<component_type::CompressionInfo>(_compression);
+    write_simple<component_type::CompressionInfo>(_compression, pc);
 }
 
-future<> sstable::read_statistics() {
-    return read_simple<component_type::Statistics>(_statistics);
+future<> sstable::read_statistics(const io_priority_class& pc) {
+    return read_simple<component_type::Statistics>(_statistics, pc);
 }
 
-void sstable::write_statistics() {
-    write_simple<component_type::Statistics>(_statistics);
+void sstable::write_statistics(const io_priority_class& pc) {
+    write_simple<component_type::Statistics>(_statistics, pc);
 }
 
 future<> sstable::open_data() {
-    return when_all(open_file_dma(filename(component_type::Index), open_flags::ro),
-                    open_file_dma(filename(component_type::Data), open_flags::ro)).then([this] (auto files) {
+    return when_all(open_checked_file_dma(sstable_read_error, filename(component_type::Index), open_flags::ro),
+                    open_checked_file_dma(sstable_read_error, filename(component_type::Data), open_flags::ro))
+                    .then([this] (auto files) {
         _index_file = std::get<file>(std::get<0>(files).get());
         _data_file  = std::get<file>(std::get<1>(files).get());
         return _data_file.size().then([this] (auto size) {
@@ -929,6 +963,16 @@ future<> sstable::open_data() {
             return _index_file.size().then([this] (auto size) {
               _index_file_size = size;
             });
+        }).then([this] {
+            // Get disk usage for this sstable (includes all components).
+            _bytes_on_disk = 0;
+            return do_for_each(_components, [this] (component_type c) {
+                return sstable_write_io_check([&] {
+                    return engine().file_size(this->filename(c));
+                }).then([this] (uint64_t bytes) {
+                    _bytes_on_disk += bytes;
+                });
+            });
         });
 
     });
@@ -936,8 +980,8 @@ future<> sstable::open_data() {
 
 future<> sstable::create_data() {
     auto oflags = open_flags::wo | open_flags::create | open_flags::exclusive;
-    return when_all(open_file_dma(filename(component_type::Index), oflags),
-                    open_file_dma(filename(component_type::Data), oflags)).then([this] (auto files) {
+    return when_all(new_sstable_component_file(sstable_write_error, filename(component_type::Index), oflags),
+                    new_sstable_component_file(sstable_write_error, filename(component_type::Data), oflags)).then([this] (auto files) {
         // FIXME: If both files could not be created, the first get below will
         // throw an exception, and second get() will not be attempted, and
         // we'll get a warning about the second future being destructed
@@ -947,15 +991,17 @@ future<> sstable::create_data() {
     });
 }
 
+// This interface is only used during tests, snapshot loading and early initialization.
+// No need to set tunable priorities for it.
 future<> sstable::load() {
     return read_toc().then([this] {
-        return read_statistics();
+        return read_statistics(default_priority_class());
     }).then([this] {
-        return read_compression();
+        return read_compression(default_priority_class());
     }).then([this] {
-        return read_filter();
+        return read_filter(default_priority_class());
     }).then([this] {;
-        return read_summary();
+        return read_summary(default_priority_class());
     }).then([this] {
         return open_data();
     });
@@ -981,15 +1027,23 @@ void sstable::write_column_name(file_writer& out, const composite& clustering_ke
     if (c.size() == 1) {
         ck_bview.remove_suffix(1);
     }
-    uint16_t sz = ck_bview.size() + c.size();
-    write(out, sz, ck_bview, c);
+    size_t sz = ck_bview.size() + c.size();
+    if (sz > std::numeric_limits<uint16_t>::max()) {
+        throw std::runtime_error(sprint("Column name too large (%d > %d)", sz, std::numeric_limits<uint16_t>::max()));
+    }
+    uint16_t sz16 = sz;
+    write(out, sz16, ck_bview, c);
 }
 
 void sstable::write_column_name(file_writer& out, bytes_view column_names) {
     column_name_helper::min_max_components(_c_stats.min_column_names, _c_stats.max_column_names, { column_names });
 
-    uint16_t sz = column_names.size();
-    write(out, sz, column_names);
+    size_t sz = column_names.size();
+    if (sz > std::numeric_limits<uint16_t>::max()) {
+        throw std::runtime_error(sprint("Column name too large (%d > %d)", sz, std::numeric_limits<uint16_t>::max()));
+    }
+    uint16_t sz16 = sz;
+    write(out, sz16, column_names);
 }
 
 
@@ -1001,7 +1055,7 @@ static inline void update_cell_stats(column_stats& c_stats, uint64_t timestamp) 
 
 // Intended to write all cell components that follow column name.
 void sstable::write_cell(file_writer& out, atomic_cell_view cell) {
-    // FIXME: range tombstone and counter cells aren't supported yet.
+    // FIXME: counter cell isn't supported yet.
 
     uint64_t timestamp = cell.timestamp();
 
@@ -1264,9 +1318,11 @@ static void seal_statistics(statistics& s, metadata_collector& collector,
 ///  @param out holds an output stream to data file.
 ///
 void sstable::do_write_components(::mutation_reader mr,
-        uint64_t estimated_partitions, schema_ptr schema, uint64_t max_sstable_size, file_writer& out) {
+        uint64_t estimated_partitions, schema_ptr schema, uint64_t max_sstable_size, file_writer& out,
+        const io_priority_class& pc) {
     file_output_stream_options options;
     options.buffer_size = sstable_buffer_size;
+    options.io_priority_class = pc;
     auto index = make_shared<file_writer>(_index_file, std::move(options));
 
     auto filter_fp_chance = schema->bloom_filter_fp_chance();
@@ -1367,25 +1423,29 @@ void sstable::do_write_components(::mutation_reader mr,
 }
 
 void sstable::prepare_write_components(::mutation_reader mr, uint64_t estimated_partitions, schema_ptr schema,
-        uint64_t max_sstable_size) {
+        uint64_t max_sstable_size, const io_priority_class& pc) {
     // CRC component must only be present when compression isn't enabled.
     bool checksum_file = has_component(sstable::component_type::CRC);
 
     if (checksum_file) {
         file_output_stream_options options;
         options.buffer_size = sstable_buffer_size;
+        options.io_priority_class = pc;
 
         auto w = make_shared<checksummed_file_writer>(_data_file, std::move(options), checksum_file);
-        this->do_write_components(std::move(mr), estimated_partitions, std::move(schema), max_sstable_size, *w);
+        this->do_write_components(std::move(mr), estimated_partitions, std::move(schema), max_sstable_size, *w, pc);
         w->close().get();
         _data_file = file(); // w->close() closed _data_file
 
         write_digest(filename(sstable::component_type::Digest), w->full_checksum());
         write_crc(filename(sstable::component_type::CRC), w->finalize_checksum());
     } else {
+        file_output_stream_options options;
+        options.io_priority_class = pc;
+
         prepare_compression(_compression, *schema);
-        auto w = make_shared<file_writer>(make_compressed_file_output_stream(_data_file, &_compression));
-        this->do_write_components(std::move(mr), estimated_partitions, std::move(schema), max_sstable_size, *w);
+        auto w = make_shared<file_writer>(make_compressed_file_output_stream(_data_file, std::move(options), &_compression));
+        this->do_write_components(std::move(mr), estimated_partitions, std::move(schema), max_sstable_size, *w, pc);
         w->close().get();
         _data_file = file(); // w->close() closed _data_file
 
@@ -1393,52 +1453,44 @@ void sstable::prepare_write_components(::mutation_reader mr, uint64_t estimated_
     }
 }
 
-future<> sstable::write_components(memtable& mt, bool backup) {
+future<> sstable::write_components(memtable& mt, bool backup, const io_priority_class& pc) {
     _collector.set_replay_position(mt.replay_position());
     return write_components(mt.make_reader(mt.schema()),
-            mt.partition_count(), mt.schema(), std::numeric_limits<uint64_t>::max(), backup);
+            mt.partition_count(), mt.schema(), std::numeric_limits<uint64_t>::max(), backup, pc);
 }
 
 future<> sstable::write_components(::mutation_reader mr,
-        uint64_t estimated_partitions, schema_ptr schema, uint64_t max_sstable_size, bool backup) {
-    return seastar::async([this, mr = std::move(mr), estimated_partitions, schema = std::move(schema), max_sstable_size, backup] () mutable {
+        uint64_t estimated_partitions, schema_ptr schema, uint64_t max_sstable_size, bool backup, const io_priority_class& pc) {
+    return seastar::async([this, mr = std::move(mr), estimated_partitions, schema = std::move(schema), max_sstable_size, backup, &pc] () mutable {
         generate_toc(schema->get_compressor_params().get_compressor(), schema->bloom_filter_fp_chance());
-        write_toc();
+        write_toc(pc);
         create_data().get();
-        prepare_write_components(std::move(mr), estimated_partitions, std::move(schema), max_sstable_size);
-        write_summary();
-        write_filter();
-        write_statistics();
+        prepare_write_components(std::move(mr), estimated_partitions, std::move(schema), max_sstable_size, pc);
+        write_summary(pc);
+        write_filter(pc);
+        write_statistics(pc);
         // NOTE: write_compression means maybe_write_compression.
-        write_compression();
+        write_compression(pc);
         seal_sstable();
 
         if (backup) {
             auto dir = get_dir() + "/backups/";
-            touch_directory(dir).get();
+            sstable_write_io_check(touch_directory, dir).get();
             create_links(dir).get();
         }
     });
 }
 
-uint64_t sstable::data_size() {
+uint64_t sstable::data_size() const {
     if (has_component(sstable::component_type::CompressionInfo)) {
         return _compression.data_len;
     }
     return _data_file_size;
 }
 
-future<uint64_t> sstable::bytes_on_disk() {
-    if (_bytes_on_disk) {
-        return make_ready_future<uint64_t>(_bytes_on_disk);
-    }
-    return do_for_each(_components, [this] (component_type c) {
-        return engine().file_size(filename(c)).then([this] (uint64_t bytes) {
-            _bytes_on_disk += bytes;
-        });
-    }).then([this] {
-        return make_ready_future<uint64_t>(_bytes_on_disk);
-    });
+uint64_t sstable::bytes_on_disk() {
+    assert(_bytes_on_disk > 0);
+    return _bytes_on_disk;
 }
 
 const bool sstable::has_component(component_type f) const {
@@ -1481,8 +1533,8 @@ const sstring sstable::filename(sstring dir, sstring ks, sstring cf, version_typ
 future<> sstable::create_links(sstring dir, int64_t generation) const {
     // TemporaryTOC is always first, TOC is always last
     auto dst = sstable::filename(dir, _ks, _cf, _version, generation, _format, component_type::TemporaryTOC);
-    return ::link_file(filename(component_type::TOC), dst).then([dir] {
-        return sync_directory(dir);
+    return sstable_write_io_check(::link_file, filename(component_type::TOC), dst).then([dir] {
+        return sstable_write_io_check(sync_directory, dir);
     }).then([this, dir, generation] {
         // FIXME: Should clean already-created links if we failed midway.
         return parallel_for_each(_components, [this, dir, generation] (auto comp) {
@@ -1490,23 +1542,25 @@ future<> sstable::create_links(sstring dir, int64_t generation) const {
                 return make_ready_future<>();
             }
             auto dst = sstable::filename(dir, _ks, _cf, _version, generation, _format, comp);
-            return ::link_file(this->filename(comp), dst);
+            return sstable_write_io_check(::link_file, this->filename(comp), dst);
         });
     }).then([dir] {
-        return sync_directory(dir);
+        return sstable_write_io_check(sync_directory, dir);
     }).then([dir, this, generation] {
         auto src = sstable::filename(dir, _ks, _cf, _version, generation, _format, component_type::TemporaryTOC);
         auto dst = sstable::filename(dir, _ks, _cf, _version, generation, _format, component_type::TOC);
-        return engine().rename_file(src, dst);
+        return sstable_write_io_check([&] {
+            return engine().rename_file(src, dst);
+        });
     }).then([dir] {
-        return sync_directory(dir);
+        return sstable_write_io_check(sync_directory, dir);
     });
 }
 
 future<> sstable::set_generation(int64_t new_generation) {
     return create_links(_dir, new_generation).then([this] {
         return remove_file(filename(component_type::TOC)).then([this] {
-            return sync_directory(_dir);
+            return sstable_write_io_check(sync_directory, _dir);
         }).then([this] {
             return parallel_for_each(_components, [this] (auto comp) {
                 if (comp == component_type::TOC) {
@@ -1569,23 +1623,36 @@ sstable::component_type sstable::component_from_sstring(sstring &s) {
     return reverse_map(s, _component_map);
 }
 
-input_stream<char> sstable::data_stream_at(uint64_t pos, uint64_t buf_size) {
+// NOTE: Prefer using data_stream() if you know the byte position at which the
+// read will stop. Knowing the end allows data_stream() to use a large a read-
+// ahead buffer before reaching the end, but not over-read at the end, so
+// data_stream() is more efficient than data_stream_at().
+input_stream<char> sstable::data_stream_at(uint64_t pos, uint64_t buf_size, const io_priority_class& pc) {
+    file_input_stream_options options;
+    options.buffer_size = buf_size;
+    options.io_priority_class = pc;
     if (_compression) {
-        return make_compressed_file_input_stream(
-                _data_file, &_compression, pos);
+        return make_compressed_file_input_stream(_data_file, &_compression,
+                pos, _compression.data_len - pos, std::move(options));
     } else {
-        file_input_stream_options options;
-        options.buffer_size = buf_size;
         return make_file_input_stream(_data_file, pos, std::move(options));
     }
 }
 
-// FIXME: to read a specific byte range, we shouldn't use the input stream
-// interface - it may cause too much read when we intend to read a small
-// range, and too small reads, and repeated waits, when reading a large range
-// which we should have started at once.
-future<temporary_buffer<char>> sstable::data_read(uint64_t pos, size_t len) {
-    return do_with(data_stream_at(pos), [len] (auto& stream) {
+input_stream<char> sstable::data_stream(uint64_t pos, size_t len, const io_priority_class& pc) {
+    file_input_stream_options options;
+    options.buffer_size = sstable_buffer_size;
+    options.io_priority_class = pc;
+    if (_compression) {
+        return make_compressed_file_input_stream(_data_file, &_compression,
+                pos, len, std::move(options));
+    } else {
+        return make_file_input_stream(_data_file, pos, len, std::move(options));
+    }
+}
+
+future<temporary_buffer<char>> sstable::data_read(uint64_t pos, size_t len, const io_priority_class& pc) {
+    return do_with(data_stream(pos, len, pc), [len] (auto& stream) {
         return stream.read_exactly(len);
     });
 }
@@ -1646,7 +1713,12 @@ future<> sstable::mutate_sstable_level(uint32_t new_level) {
     // we will always write sequentially is a powerful one, and this does not merit an
     // exception.
     return seastar::async([this] {
-        write_statistics();
+        // This is not part of the standard memtable flush path, but there is no reason
+        // to come up with a class just for that. It is used by the snapshot/restore mechanism
+        // which comprises mostly hard link creation and this operation at the end + this operation,
+        // and also (eventually) by some compaction strategy. In any of the cases, it won't be high
+        // priority enough so we will use the default priority
+        write_statistics(default_priority_class());
     });
 }
 
@@ -1660,11 +1732,13 @@ sstable::~sstable() {
     if (_index_file) {
         _index_file.close().handle_exception([save = _index_file, op = background_jobs().start()] (auto ep) {
             sstlog.warn("sstable close index_file failed: {}", ep);
+            general_disk_error();
         });
     }
     if (_data_file) {
         _data_file.close().handle_exception([save = _data_file, op = background_jobs().start()] (auto ep) {
             sstlog.warn("sstable close data_file failed: {}", ep);
+            general_disk_error();
         });
     }
 
@@ -1698,9 +1772,11 @@ sstable::shared_remove_by_toc_name(sstring toc_name, bool shared) {
         return remove_by_toc_name(toc_name);
     } else {
         auto shard = std::hash<sstring>()(toc_name) % smp::count;
-        return smp::submit_to(shard, [toc_name] {
-            auto& counter = _shards_agreeing_to_remove_sstable[toc_name];
-            if (++counter == smp::count) {
+        return smp::submit_to(shard, [toc_name, src_shard = engine().cpu_id()] {
+            auto& remove_set = _shards_agreeing_to_remove_sstable[toc_name];
+            remove_set.insert(src_shard);
+            auto counter = remove_set.size();
+            if (counter == smp::count) {
                 _shards_agreeing_to_remove_sstable.erase(toc_name);
                 return remove_by_toc_name(toc_name);
             } else {
@@ -1712,9 +1788,11 @@ sstable::shared_remove_by_toc_name(sstring toc_name, bool shared) {
 
 future<>
 fsync_directory(sstring fname) {
-    return open_directory(dirname(fname)).then([] (file f) {
-        return do_with(std::move(f), [] (file& f) {
-            return f.flush();
+    return sstable_write_io_check([&] {
+        return open_checked_directory(sstable_write_error ,dirname(fname)).then([] (file f) {
+            return do_with(std::move(f), [] (file& f) {
+                return f.flush();
+            });
         });
     });
 }
@@ -1722,46 +1800,87 @@ fsync_directory(sstring fname) {
 future<>
 remove_by_toc_name(sstring sstable_toc_name) {
     return seastar::async([sstable_toc_name] {
-        auto dir = dirname(sstable_toc_name);
-        auto toc_file = open_file_dma(sstable_toc_name, open_flags::ro).get0();
+        sstring prefix = sstable_toc_name.substr(0, sstable_toc_name.size() - TOC_SUFFIX.size());
+        auto new_toc_name = prefix + TEMPORARY_TOC_SUFFIX;
+        sstring dir;
+
+        if (sstable_write_io_check(file_exists, sstable_toc_name).get0()) {
+            dir = dirname(sstable_toc_name);
+            sstable_write_io_check(rename_file, sstable_toc_name, new_toc_name).get();
+            sstable_write_io_check(fsync_directory, dir).get();
+        } else {
+            dir = dirname(new_toc_name);
+        }
+
+        auto toc_file = open_checked_file_dma(sstable_read_error, new_toc_name, open_flags::ro).get0();
         auto in = make_file_input_stream(toc_file);
         auto size = toc_file.size().get0();
         auto text = in.read_exactly(size).get0();
         in.close().get();
-        remove_file(sstable_toc_name).get();
-        fsync_directory(dir).get();
         std::vector<sstring> components;
         sstring all(text.begin(), text.end());
         boost::split(components, all, boost::is_any_of("\n"));
-        auto toc_txt = sstring("TOC.txt");
-        sstring prefix = sstable_toc_name.substr(0, sstable_toc_name.size() - toc_txt.size());
-        parallel_for_each(components, [prefix, toc_txt] (sstring component) {
+        parallel_for_each(components, [prefix] (sstring component) {
             if (component.empty()) {
                 // eof
                 return make_ready_future<>();
             }
-            if (component == toc_txt) {
+            if (component == TOC_SUFFIX) {
                 // already deleted
                 return make_ready_future<>();
             }
-            return remove_file(prefix + component);
+            return sstable_write_io_check(remove_file, prefix + component);
         }).get();
-        fsync_directory(dir).get();
+        sstable_write_io_check(fsync_directory, dir).get();
+        sstable_write_io_check(remove_file, new_toc_name).get();
+    });
+}
+
+future<>
+sstable::mark_for_deletion_on_disk() {
+    mark_for_deletion();
+
+    auto toc_name = filename(component_type::TOC);
+    auto shard = std::hash<sstring>()(toc_name) % smp::count;
+
+    return smp::submit_to(shard, [toc_name] {
+        static thread_local std::unordered_set<sstring> renaming;
+
+        if (renaming.count(toc_name) > 0) {
+            return make_ready_future<>();
+        }
+
+        renaming.emplace(toc_name);
+
+        return seastar::async([toc_name] {
+            if (!sstable_write_io_check(file_exists, toc_name).get0()) {
+                return; // already gone
+            }
+
+            auto dir = dirname(toc_name);
+            auto toc_file = open_checked_file_dma(sstable_read_error, toc_name, open_flags::ro).get0();
+            sstring prefix = toc_name.substr(0, toc_name.size() - TOC_SUFFIX.size());
+            auto new_toc_name = prefix + TEMPORARY_TOC_SUFFIX;
+            sstable_write_io_check(rename_file, toc_name, new_toc_name).get();
+            sstable_write_io_check(fsync_directory, dir).get();
+        }).finally([toc_name] {
+            renaming.erase(toc_name);
+        });
     });
 }
 
 future<>
 sstable::remove_sstable_with_temp_toc(sstring ks, sstring cf, sstring dir, int64_t generation, version_types v, format_types f) {
     return seastar::async([ks, cf, dir, generation, v, f] {
-        auto toc = file_exists(filename(dir, ks, cf, v, generation, f, component_type::TOC)).get0();
+        auto toc = sstable_write_io_check(file_exists, filename(dir, ks, cf, v, generation, f, component_type::TOC)).get0();
         // assert that toc doesn't exist for sstable with temporary toc.
         assert(toc == false);
 
-        auto tmptoc = file_exists(filename(dir, ks, cf, v, generation, f, component_type::TemporaryTOC)).get0();
+        auto tmptoc = sstable_write_io_check(file_exists, filename(dir, ks, cf, v, generation, f, component_type::TemporaryTOC)).get0();
         // assert that temporary toc exists for this sstable.
         assert(tmptoc == true);
 
-        sstlog.warn("Deleting components of sstable from {}/{} of generation {} that has a temporary TOC", ks, cf, generation);
+        sstlog.warn("Deleting components of sstable from {}.{} of generation {} that has a temporary TOC", ks, cf, generation);
 
         for (auto& entry : sstable::_component_map) {
             // Skipping TemporaryTOC because it must be the last component to
@@ -1777,24 +1896,24 @@ sstable::remove_sstable_with_temp_toc(sstring ks, sstring cf, sstring dir, int64
 
             auto file_path = filename(dir, ks, cf, v, generation, f, entry.first);
             // Skip component that doesn't exist.
-            auto exists = file_exists(file_path).get0();
+            auto exists = sstable_write_io_check(file_exists, file_path).get0();
             if (!exists) {
                 continue;
             }
-            remove_file(file_path).get();
+            sstable_write_io_check(remove_file, file_path).get();
         }
-        fsync_directory(dir).get();
+        sstable_write_io_check(fsync_directory, dir).get();
         // Removing temporary
-        remove_file(filename(dir, ks, cf, v, generation, f, component_type::TemporaryTOC)).get();
+        sstable_write_io_check(remove_file, filename(dir, ks, cf, v, generation, f, component_type::TemporaryTOC)).get();
         // Fsync'ing column family dir to guarantee that deletion completed.
-        fsync_directory(dir).get();
+        sstable_write_io_check(fsync_directory, dir).get();
     });
 }
 
 future<range<partition_key>>
 sstable::get_sstable_key_range(const schema& s, sstring ks, sstring cf, sstring dir, int64_t generation, version_types v, format_types f) {
     auto sst = std::make_unique<sstable>(ks, cf, dir, generation, v, f);
-    auto fut = sst->read_summary();
+    auto fut = sst->read_summary(default_priority_class());
     return std::move(fut).then([sst = std::move(sst), &s] () mutable {
         auto first = sst->get_first_partition_key(s);
         auto last = sst->get_last_partition_key(s);

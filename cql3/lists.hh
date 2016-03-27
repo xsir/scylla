@@ -56,6 +56,7 @@ class lists {
 public:
     static shared_ptr<column_specification> index_spec_of(shared_ptr<column_specification> column);
     static shared_ptr<column_specification> value_spec_of(shared_ptr<column_specification> column);
+    static shared_ptr<column_specification> uuid_index_spec_of(shared_ptr<column_specification>);
 
     class literal : public term::raw {
         const std::vector<shared_ptr<term::raw>> _elements;
@@ -78,9 +79,9 @@ public:
         explicit value(std::vector<bytes_opt> elements)
             : _elements(std::move(elements)) {
         }
-        static value from_serialized(bytes_view v, list_type type, serialization_format sf);
+        static value from_serialized(bytes_view v, list_type type, cql_serialization_format sf);
         virtual bytes_opt get(const query_options& options) override;
-        virtual bytes get_with_protocol_version(serialization_format sf) override;
+        virtual bytes get_with_protocol_version(cql_serialization_format sf) override;
         bool equals(shared_ptr<list_type_impl> lt, const value& v);
         virtual std::vector<bytes_opt> get_elements() override;
         virtual sstring to_string() const;
@@ -149,6 +150,7 @@ public:
     };
 
     class setter_by_index : public operation {
+    protected:
         shared_ptr<term> _idx;
     public:
         setter_by_index(const column_definition& column, shared_ptr<term> idx, shared_ptr<term> t)
@@ -156,6 +158,14 @@ public:
         }
         virtual bool requires_read() override;
         virtual void collect_marker_specification(shared_ptr<variable_specifications> bound_names);
+        virtual void execute(mutation& m, const exploded_clustering_prefix& prefix, const update_parameters& params) override;
+    };
+
+    class setter_by_uuid : public setter_by_index {
+    public:
+        setter_by_uuid(const column_definition& column, shared_ptr<term> idx, shared_ptr<term> t)
+            : setter_by_index(column, std::move(idx), std::move(t)) {
+        }
         virtual void execute(mutation& m, const exploded_clustering_prefix& prefix, const update_parameters& params) override;
     };
 

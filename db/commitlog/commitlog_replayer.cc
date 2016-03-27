@@ -53,7 +53,6 @@
 #include "database.hh"
 #include "sstables/sstables.hh"
 #include "db/system_keyspace.hh"
-#include "db/serializer.hh"
 #include "cql3/query_processor.hh"
 #include "log.hh"
 #include "converting_mutation_partition_applier.hh"
@@ -311,7 +310,7 @@ future<> db::commitlog_replayer::recover(std::vector<sstring> files) {
             try {
                 std::rethrow_exception(ep);
             } catch (std::invalid_argument&) {
-                logger.error("Scylla cannot process {}. Make sure to fully flush all Cassandra commit log files to sstable before migrating.");
+                logger.error("Scylla cannot process {}. Make sure to fully flush all Cassandra commit log files to sstable before migrating.", f);
                 throw;
             } catch (...) {
                 throw;

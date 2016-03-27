@@ -59,6 +59,12 @@
 #include "gms/failure_detector.hh"
 #include "service/storage_service.hh"
 #include "schema_registry.hh"
+#include "idl/uuid.dist.hh"
+#include "idl/frozen_schema.dist.hh"
+#include "serializer_impl.hh"
+#include "serialization_visitors.hh"
+#include "idl/uuid.dist.impl.hh"
+#include "idl/frozen_schema.dist.impl.hh"
 
 static logging::logger logger("batchlog_manager");
 
@@ -119,15 +125,11 @@ mutation db::batchlog_manager::get_batch_log_mutation_for(const std::vector<muta
     auto timestamp = api::new_timestamp();
     auto data = [this, &mutations] {
         std::vector<canonical_mutation> fm(mutations.begin(), mutations.end());
-        const auto size = std::accumulate(fm.begin(), fm.end(), size_t(0), [](size_t s, auto& m) {
-            return s + serializer<canonical_mutation>{m}.size();
-        });
-        bytes buf(bytes::initialized_later(), size);
-        data_output out(buf);
+        bytes_ostream out;
         for (auto& m : fm) {
-            serializer<canonical_mutation>{m}(out);
+            ser::serialize(out, m);
         }
-        return buf;
+        return to_bytes(out.linearize());
     }();
 
     mutation m(key, schema);
@@ -155,47 +157,58 @@ future<> db::batchlog_manager::replay_all_failed_batches() {
         auto written_at = row.get_as<db_clock::time_point>("written_at");
         auto id = row.get_as<utils::UUID>("id");
         // enough time for the actual write + batchlog entry mutation delivery (two separate requests).
-        // enough time for the actual write + batchlog entry mutation delivery (two separate requests).
         auto timeout = get_batch_log_timeout();
         if (db_clock::now() < written_at + timeout) {
             logger.debug("Skipping replay of {}, too fresh", id);
             return make_ready_future<>();
         }
-        // not used currently. ever?
-        //auto version = row.has("version") ? row.get_as<uint32_t>("version") : /*MessagingService.VERSION_12*/6u;
+
+        // check version of serialization format
+        if (!row.has("version")) {
+            logger.warn("Skipping logged batch because of unknown version");
+            return make_ready_future<>();
+        }
+
+        auto version = row.get_as<int32_t>("version");
+        if (version != net::messaging_service::current_version) {
+            logger.warn("Skipping logged batch because of incorrect version");
+            return make_ready_future<>();
+        }
+
         auto data = row.get_blob("data");
 
         logger.debug("Replaying batch {}", id);
 
         auto fms = make_lw_shared<std::deque<canonical_mutation>>();
-        data_input in(data);
-        while (in.has_next()) {
-            fms->emplace_back(serializer<canonical_mutation>::read(in));
+        auto in = ser::as_input_stream(data);
+        while (in.size()) {
+            fms->emplace_back(ser::deserialize(in, boost::type<canonical_mutation>()));
         }
 
-        auto mutations = make_lw_shared<std::vector<mutation>>();
         auto size = data.size();
 
-        return repeat([this, fms = std::move(fms), written_at, mutations]() mutable {
-            if (fms->empty()) {
-                return make_ready_future<stop_iteration>(stop_iteration::yes);
-            }
-            auto& fm = fms->front();
-            auto mid = fm.column_family_id();
-            return system_keyspace::get_truncated_at(mid).then([this, mid, &fm, written_at, mutations](db_clock::time_point t) {
-                schema_ptr s = _qp.db().local().find_schema(mid);
+        return map_reduce(*fms, [this, written_at] (canonical_mutation& fm) {
+            return system_keyspace::get_truncated_at(fm.column_family_id()).then([written_at, &fm] (db_clock::time_point t) ->
+                    std::experimental::optional<std::reference_wrapper<canonical_mutation>> {
                 if (written_at > t) {
-                    mutations->emplace_back(fm.to_mutation(s));
+                    return { std::ref(fm) };
+                } else {
+                    return {};
                 }
-            }).then([fms] {
-                fms->pop_front();
-                return make_ready_future<stop_iteration>(stop_iteration::no);
             });
-        }).then([this, id, mutations, limiter, written_at, size] {
-            if (mutations->empty()) {
+        },
+        std::vector<mutation>(),
+        [this] (std::vector<mutation> mutations, std::experimental::optional<std::reference_wrapper<canonical_mutation>> fm) {
+            if (fm) {
+                schema_ptr s = _qp.db().local().find_schema(fm.value().get().column_family_id());
+                mutations.emplace_back(fm.value().get().to_mutation(s));
+            }
+            return mutations;
+        }).then([this, id, limiter, written_at, size, fms] (std::vector<mutation> mutations) {
+            if (mutations.empty()) {
                 return make_ready_future<>();
             }
-            const auto ttl = [this, mutations, written_at]() -> clock_type {
+            const auto ttl = [this, &mutations, written_at]() -> clock_type {
                 /*
                  * Calculate ttl for the mutations' hints (and reduce ttl by the time the mutations spent in the batchlog).
                  * This ensures that deletes aren't "undone" by an old batch replay.
@@ -217,8 +230,8 @@ future<> db::batchlog_manager::replay_all_failed_batches() {
             // Our normal write path does not add much redundancy to the dispatch, and rate is handled after send
             // in both cases.
             // FIXME: verify that the above is reasonably true.
-            return limiter->reserve(size).then([this, mutations, id] {
-                return _qp.proxy().local().mutate(std::move(*mutations), db::consistency_level::ANY);
+            return limiter->reserve(size).then([this, mutations = std::move(mutations), id] {
+                return _qp.proxy().local().mutate(mutations, db::consistency_level::ANY);
             });
         }).then([this, id] {
             // delete batch

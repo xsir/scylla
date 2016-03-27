@@ -1,17 +1,25 @@
 #!/bin/sh -e
 
+. /etc/os-release
 print_usage() {
-    echo "build_rpm.sh -R"
-    echo "  -R  rebuild dependency packages (CentOS)"
+    echo "build_rpm.sh --rebuild-dep --jobs 2"
+    echo "  --rebuild-dep  rebuild dependency packages (CentOS)"
+    echo "  --jobs  specify number of jobs"
     exit 1
 }
 REBUILD=0
-while getopts Rh OPT; do
-    case "$OPT" in
-        "R")
+JOBS=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        "--rebuild-dep")
             REBUILD=1
+            shift 1
             ;;
-        "h")
+        "--jobs")
+            JOBS=$2
+            shift 2
+            ;;
+        *)
             print_usage
             ;;
     esac
@@ -24,7 +32,6 @@ if [ ! -e dist/redhat/build_rpm.sh ]; then
     exit 1
 fi
 
-. /etc/os-release
 if [ "$ID" != "fedora" ] && [ "$ID" != "centos" ]; then
     echo "Unsupported distribution"
     exit 1
@@ -43,7 +50,7 @@ if [ "$ID" = "centos" ]; then
     if [ $REBUILD = 1 ]; then
         ./dist/redhat/centos_dep/build_dependency.sh
     else
-        sudo curl https://s3.amazonaws.com/downloads.scylladb.com/rpm/centos/scylla.repo -o /etc/yum.repos.d/scylla.repo
+        sudo curl https://s3.amazonaws.com/downloads.scylladb.com/rpm/unstable/centos/master/latest/scylla.repo -o /etc/yum.repos.d/scylla.repo
     fi
 fi
 VERSION=$(./SCYLLA-VERSION-GEN)
@@ -56,10 +63,18 @@ cp dist/redhat/scylla-server.spec.in $RPMBUILD/SPECS/scylla-server.spec
 sed -i -e "s/@@VERSION@@/$SCYLLA_VERSION/g" $RPMBUILD/SPECS/scylla-server.spec
 sed -i -e "s/@@RELEASE@@/$SCYLLA_RELEASE/g" $RPMBUILD/SPECS/scylla-server.spec
 if [ "$ID" = "fedora" ]; then
-    rpmbuild -bs --define "_topdir $RPMBUILD" $RPMBUILD/SPECS/scylla-server.spec
+    if [ $JOBS -gt 0 ]; then
+        rpmbuild -bs --define "_topdir $RPMBUILD" --define "_smp_mflags -j$JOBS" $RPMBUILD/SPECS/scylla-server.spec
+    else
+        rpmbuild -bs --define "_topdir $RPMBUILD" $RPMBUILD/SPECS/scylla-server.spec
+    fi
     mock rebuild --resultdir=`pwd`/build/rpms $RPMBUILD/SRPMS/scylla-server-$VERSION*.src.rpm
 else
     sudo yum-builddep -y  $RPMBUILD/SPECS/scylla-server.spec
     . /etc/profile.d/scylla.sh
-    rpmbuild -ba --define "_topdir $RPMBUILD" $RPMBUILD/SPECS/scylla-server.spec
+    if [ $JOBS -gt 0 ]; then
+        rpmbuild -ba --define "_topdir $RPMBUILD" --define "_smp_mflags -j$JOBS" $RPMBUILD/SPECS/scylla-server.spec
+    else
+        rpmbuild -ba --define "_topdir $RPMBUILD" $RPMBUILD/SPECS/scylla-server.spec
+    fi
 fi

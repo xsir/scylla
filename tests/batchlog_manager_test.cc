@@ -37,6 +37,11 @@
 #include "cql3/query_processor.hh"
 #include "db/batchlog_manager.hh"
 
+#include "disk-error-handler.hh"
+
+thread_local disk_error_signal_type commit_error;
+thread_local disk_error_signal_type general_disk_error;
+
 static atomic_cell make_atomic_cell(bytes value) {
     return atomic_cell::make_live(0, std::move(value));
 };
@@ -59,7 +64,8 @@ SEASTAR_TEST_CASE(test_execute_batch) {
 
             using namespace std::chrono_literals;
 
-            auto bm = bp->get_batch_log_mutation_for({ m }, s->id(), 9, db_clock::now() - db_clock::duration(3h));
+            auto version = net::messaging_service::current_version;
+            auto bm = bp->get_batch_log_mutation_for({ m }, s->id(), version, db_clock::now() - db_clock::duration(3h));
 
             return qp.proxy().local().mutate_locally(bm).then([bp] {
                 return bp->count_all_batches().then([](auto n) {

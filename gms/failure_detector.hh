@@ -48,6 +48,8 @@
 #include <cmath>
 #include <list>
 #include <map>
+#include <experimental/optional>
+
 
 namespace gms {
 class inet_address;
@@ -65,7 +67,7 @@ private:
     // because everyone seems pretty accustomed to the default of 8, and users who have
     // already tuned their phi_convict_threshold for their own environments won't need to
     // change.
-    static constexpr double PHI_FACTOR{1.0 / std::log(10.0)};
+    static constexpr double PHI_FACTOR{M_LOG10El};
 
 public:
     arrival_window(int size)
@@ -102,7 +104,8 @@ private:
     // because everyone seems pretty accustomed to the default of 8, and users who have
     // already tuned their phi_convict_threshold for their own environments won't need to
     // change.
-    static constexpr double PHI_FACTOR{1.0 / std::log(10.0)}; // 0.434...
+    static constexpr double PHI_FACTOR{M_LOG10El};
+
     std::map<inet_address, arrival_window> _arrival_samples;
     std::list<i_failure_detection_event_listener*> _fd_evnt_listeners;
     double _phi = 8;
@@ -123,16 +126,13 @@ private:
         return DEFAULT_MAX_PAUSE;
     }
 
-    arrival_window::clk::time_point _last_interpret;
+    std::experimental::optional<arrival_window::clk::time_point> _last_interpret;
     arrival_window::clk::time_point _last_paused;
 
 public:
-    failure_detector() {
-        _last_interpret = arrival_window::clk::now();
-    }
+    failure_detector() = default;
 
     failure_detector(double phi) : _phi(phi) {
-        _last_interpret = arrival_window::clk::now();
     }
 
     future<> stop() {

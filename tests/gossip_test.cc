@@ -29,17 +29,20 @@
 #include "gms/failure_detector.hh"
 #include "gms/gossiper.hh"
 #include "core/reactor.hh"
-#include "service/pending_range_calculator_service.hh"
 #include "service/storage_service.hh"
 #include "core/distributed.hh"
 #include "database.hh"
+
+#include "disk-error-handler.hh"
+
+thread_local disk_error_signal_type commit_error;
+thread_local disk_error_signal_type general_disk_error;
 
 SEASTAR_TEST_CASE(test_boot_shutdown){
     return seastar::async([] {
         distributed<database> db;
         utils::fb_utilities::set_broadcast_address(gms::inet_address("127.0.0.1"));
         locator::i_endpoint_snitch::create_snitch("SimpleSnitch").get();
-        service::get_pending_range_calculator_service().start(std::ref(db));
         service::get_storage_service().start(std::ref(db)).get();
         db.start().get();
         net::get_messaging_service().start(gms::inet_address("127.0.0.1")).get();
@@ -48,10 +51,9 @@ SEASTAR_TEST_CASE(test_boot_shutdown){
         gms::get_gossiper().start().get();
         gms::get_gossiper().stop().get();
         gms::get_failure_detector().stop().get();
-        net::get_messaging_service().stop().get();
         db.stop().get();
         service::get_storage_service().stop().get();
-        service::get_pending_range_calculator_service().stop().get();
+        net::get_messaging_service().stop().get();
         locator::i_endpoint_snitch::stop_snitch().get();
     });
 }

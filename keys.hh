@@ -27,6 +27,7 @@
 #include "compound_compat.hh"
 #include "utils/managed_bytes.hh"
 #include "hashing.hh"
+#include "database_fwd.hh"
 
 //
 // This header defines type system for primary key holders.
@@ -49,13 +50,6 @@
 // (the key value itself). Any information which can be inferred from schema
 // is not stored. Therefore accessors need to be provided with a pointer to
 // schema, from which information about structure is extracted.
-
-class partition_key;
-class partition_key_view;
-class clustering_key_prefix;
-class clustering_key_prefix_view;
-using clustering_key = clustering_key_prefix;
-using clustering_key_view = clustering_key_prefix_view;
 
 // Abstracts a view to serialized compound.
 template <typename TopLevelView>
@@ -109,13 +103,24 @@ public:
 
     // begin() and end() return iterators over components of this compound. The iterator yields a bytes_view to the component.
     // The iterators satisfy InputIterator concept.
+    auto begin() const {
+        return TopLevelView::compound::element_type::begin(representation());
+    }
+
+    // See begin()
+    auto end() const {
+        return TopLevelView::compound::element_type::end(representation());
+    }
+
+    // begin() and end() return iterators over components of this compound. The iterator yields a bytes_view to the component.
+    // The iterators satisfy InputIterator concept.
     auto begin(const schema& s) const {
-        return get_compound_type(s)->begin(representation());
+        return begin();
     }
 
     // See begin()
     auto end(const schema& s) const {
-        return get_compound_type(s)->end(representation());
+        return end();
     }
 
     bytes_view get_component(const schema& s, size_t idx) const {
@@ -125,8 +130,13 @@ public:
     }
 
     // Returns a range of bytes_view
+    auto components() const {
+        return TopLevelView::compound::element_type::components(representation());
+    }
+
+    // Returns a range of bytes_view
     auto components(const schema& s) const {
-        return boost::make_iterator_range(begin(s), end(s));
+        return components();
     }
 
     template<typename Hasher>
@@ -152,12 +162,13 @@ public:
         return from_exploded(s, {});
     }
 
-    static TopLevel from_exploded(const schema& s, const std::vector<bytes>& v) {
-        return TopLevel::from_bytes(get_compound_type(s)->serialize_value(v));
+    template<typename RangeOfSerializedComponents>
+    static TopLevel from_exploded(RangeOfSerializedComponents&& v) {
+        return TopLevel(std::forward<RangeOfSerializedComponents>(v));
     }
 
-    static TopLevel from_exploded(const schema& s, std::vector<bytes>&& v) {
-        return TopLevel::from_bytes(get_compound_type(s)->serialize_value(std::move(v)));
+    static TopLevel from_exploded(const schema& s, const std::vector<bytes>& v) {
+        return from_exploded(v);
     }
 
     // We don't allow optional values, but provide this method as an efficient adaptor
@@ -195,6 +206,14 @@ public:
     // FIXME: return views
     std::vector<bytes> explode(const schema& s) const {
         return get_compound_type(s)->deserialize_value(_bytes);
+    }
+
+    std::vector<bytes> explode() const {
+        std::vector<bytes> result;
+        for (bytes_view c : components()) {
+            result.emplace_back(to_bytes(c));
+        }
+        return result;
     }
 
     struct less_compare {
@@ -245,7 +264,7 @@ public:
         return _bytes;
     }
 
-    bytes_view representation() const {
+    const managed_bytes& representation() const {
         return _bytes;
     }
 
@@ -258,6 +277,16 @@ public:
     // See begin()
     auto end(const schema& s) const {
         return get_compound_type(s)->end(_bytes);
+    }
+
+    // Returns a range of bytes_view
+    auto components() const {
+        return TopLevelView::compound::element_type::components(representation());
+    }
+
+    // Returns a range of bytes_view
+    auto components(const schema& s) const {
+        return components();
     }
 
     bytes_view get_component(const schema& s, size_t idx) const {
@@ -454,7 +483,7 @@ template <typename TopLevel, typename TopLevelView, typename FullTopLevel>
 class prefix_compound_wrapper : public compound_wrapper<TopLevel, TopLevelView> {
     using base = compound_wrapper<TopLevel, TopLevelView>;
 protected:
-    prefix_compound_wrapper(bytes&& b) : base(std::move(b)) {}
+    prefix_compound_wrapper(managed_bytes&& b) : base(std::move(b)) {}
 public:
     using prefix_view_type = prefix_view_on_prefix_compound<TopLevel>;
 
@@ -536,19 +565,32 @@ public:
 };
 
 class partition_key : public compound_wrapper<partition_key, partition_key_view> {
-public:
-    using c_type = compound_type<allow_prefixes::no>;
-    explicit partition_key(bytes&& b)
+    explicit partition_key(managed_bytes&& b)
         : compound_wrapper<partition_key, partition_key_view>(std::move(b))
     { }
-    partition_key(const partition_key_view& key)
-        : partition_key(bytes(key.representation().begin(), key.representation().end()))
+public:
+    using c_type = compound_type<allow_prefixes::no>;
+
+    template<typename RangeOfSerializedComponents>
+    partition_key(RangeOfSerializedComponents&& v)
+        : compound_wrapper(managed_bytes(c_type::serialize_value(std::forward<RangeOfSerializedComponents>(v))))
+    { }
+
+    partition_key(partition_key&& v) = default;
+    partition_key(const partition_key& v) = default;
+    partition_key(partition_key& v) = default;
+    partition_key& operator=(const partition_key&) = default;
+    partition_key& operator=(partition_key&) = default;
+    partition_key& operator=(partition_key&&) = default;
+
+    partition_key(partition_key_view key)
+        : partition_key(managed_bytes(key.representation()))
     { }
 
     using compound = lw_shared_ptr<c_type>;
 
-    static partition_key from_bytes(bytes b) {
-        return partition_key(std::move(b));
+    static partition_key from_bytes(bytes_view b) {
+        return partition_key(managed_bytes(b));
     }
 
     static const compound& get_compound_type(const schema& s) {
@@ -569,6 +611,10 @@ public:
     // Checks if keys are equal in a way which is compatible with Origin.
     bool legacy_equal(const schema& s, const partition_key& o) const {
         return view().legacy_equal(s, o);
+    }
+
+    void validate(const schema& s) const {
+        return s.partition_key_type()->validate(representation());
     }
 
     friend std::ostream& operator<<(std::ostream& out, const partition_key& pk);
@@ -611,18 +657,30 @@ public:
 };
 
 class clustering_key_prefix : public prefix_compound_wrapper<clustering_key_prefix, clustering_key_prefix_view, clustering_key> {
-public:
-    explicit clustering_key_prefix(bytes&& b)
-        : prefix_compound_wrapper<clustering_key_prefix, clustering_key_prefix_view, clustering_key>(std::move(b))
+    explicit clustering_key_prefix(managed_bytes&& b)
+            : prefix_compound_wrapper<clustering_key_prefix, clustering_key_prefix_view, clustering_key>(std::move(b))
     { }
+public:
+    template<typename RangeOfSerializedComponents>
+    clustering_key_prefix(RangeOfSerializedComponents&& v)
+        : prefix_compound_wrapper(compound::element_type::serialize_value(std::forward<RangeOfSerializedComponents>(v)))
+    { }
+
+    clustering_key_prefix(clustering_key_prefix&& v) = default;
+    clustering_key_prefix(const clustering_key_prefix& v) = default;
+    clustering_key_prefix(clustering_key_prefix& v) = default;
+    clustering_key_prefix& operator=(const clustering_key_prefix&) = default;
+    clustering_key_prefix& operator=(clustering_key_prefix&) = default;
+    clustering_key_prefix& operator=(clustering_key_prefix&&) = default;
+
     clustering_key_prefix(clustering_key_prefix_view v)
-        : clustering_key_prefix(bytes(v.representation().begin(), v.representation().end()))
+        : clustering_key_prefix(managed_bytes(v.representation()))
     { }
 
     using compound = lw_shared_ptr<compound_type<allow_prefixes::yes>>;
 
-    static clustering_key_prefix from_bytes(bytes b) {
-        return clustering_key_prefix(std::move(b));
+    static clustering_key_prefix from_bytes(bytes_view b) {
+        return clustering_key_prefix(managed_bytes(b));
     }
 
     static const compound& get_compound_type(const schema& s) {
@@ -636,21 +694,3 @@ public:
     friend std::ostream& operator<<(std::ostream& out, const clustering_key_prefix& ckp);
 };
 
-namespace db {
-
-template<> serializer<partition_key_view>::serializer(const partition_key_view &);
-template<> void serializer<partition_key_view>::write(output&, const partition_key_view&);
-template<> void serializer<partition_key_view>::read(partition_key_view&, input&);
-template<> partition_key_view serializer<partition_key_view>::read(input&);
-template<> void serializer<partition_key_view>::skip(input&);
-
-template<> serializer<clustering_key_prefix_view>::serializer(const clustering_key_prefix_view &);
-template<> void serializer<clustering_key_prefix_view>::write(output&, const clustering_key_prefix_view&);
-template<> void serializer<clustering_key_prefix_view>::read(clustering_key_prefix_view&, input&);
-template<> clustering_key_prefix_view serializer<clustering_key_prefix_view>::read(input&);
-
-typedef serializer<partition_key_view> partition_key_view_serializer;
-typedef serializer<clustering_key_view> clustering_key_view_serializer;
-typedef serializer<clustering_key_prefix_view> clustering_key_prefix_view_serializer;
-
-}

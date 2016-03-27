@@ -1,0 +1,45 @@
+#!/bin/sh -e
+#
+#  Copyright (C) 2015 ScyllaDB
+
+print_usage() {
+    echo "scylla_coredump_setup --dump-to-raiddir"
+    echo "  --dump-to-raiddir  store coredump to /var/lib/scylla"
+    exit 1
+}
+
+SYMLINK=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        "--dump-to-raiddir")
+            SYMLINK=1
+            shift 1
+            ;;
+        *)
+            print_usage
+            ;;
+    esac
+done
+
+
+. /etc/os-release
+
+if [ "$ID" = "ubuntu" ]; then
+    apt-get remove -y apport-noui
+    sysctl -p /etc/sysctl.d/99-scylla.conf
+else
+    cat << EOS > /etc/systemd/coredump.conf
+[Coredump]
+Storage=external
+Compress=yes
+ProcessSizeMax=1024G
+ExternalSizeMax=1024G
+EOS
+    if [ $SYMLINK = 1 ]; then
+        rm -rf /var/lib/systemd/coredump
+        ln -sf /var/lib/scylla/coredump /var/lib/systemd/coredump
+    fi
+    systemctl daemon-reload
+    echo "kernel.core_pattern=|/usr/lib/systemd/systemd-coredump %p %u %g %s %t %e" > /etc/sysctl.d/99-coredump.conf
+    sysctl -p /etc/sysctl.d/99-coredump.conf
+fi

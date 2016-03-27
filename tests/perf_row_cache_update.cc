@@ -32,6 +32,11 @@
 #include "memtable.hh"
 #include "tests/perf/perf.hh"
 
+#include "disk-error-handler.hh"
+
+thread_local disk_error_signal_type commit_error;
+thread_local disk_error_signal_type general_disk_error;
+
 static
 dht::decorated_key new_key(schema_ptr s) {
     static thread_local int next = 0;
@@ -68,8 +73,8 @@ int main(int argc, char** argv) {
                 .build();
 
             cache_tracker tracker;
-            row_cache cache(s, [] (schema_ptr, auto&&) { return make_empty_reader(); },
-                [] (auto&&) { return key_reader(); }, tracker);
+            row_cache cache(s, mutation_source([] (schema_ptr, auto&&) { return make_empty_reader(); }),
+                key_source([] (auto&&) { return key_reader(); }), tracker);
 
             size_t partitions = app.configuration()["partitions"].as<unsigned>();
             size_t cell_size = app.configuration()["cell-size"].as<unsigned>();

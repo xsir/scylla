@@ -22,30 +22,21 @@
 #pragma once
 
 #include "core/reactor.hh"
-#include "core/iostream.hh"
 #include "core/distributed.hh"
-#include "core/print.hh"
 #include "core/sstring.hh"
-#include "core/do_with.hh"
-#include "net/api.hh"
-#include "utils/serialization.hh"
 #include "gms/inet_address.hh"
 #include "rpc/rpc_types.hh"
 #include <unordered_map>
-#include "frozen_mutation.hh"
-#include "frozen_schema.hh"
 #include "query-request.hh"
-#include "db/serializer.hh"
 #include "mutation_query.hh"
-#include "repair/repair.hh"
+#include "range.hh"
 
 #include <seastar/net/tls.hh>
 
 // forward declarations
-namespace streaming { namespace messages {
-    class stream_init_message;
+namespace streaming {
     class prepare_message;
-}}
+}
 
 namespace gms {
     class gossip_digest_syn;
@@ -61,6 +52,20 @@ namespace db {
 class seed_provider_type;
 }
 
+class frozen_mutation;
+class frozen_schema;
+class partition_checksum;
+
+namespace dht {
+    class token;
+}
+
+namespace query {
+    using partition_range = range<ring_position>;
+    class read_command;
+    class result;
+}
+
 namespace net {
 
 /* All verb handler identifiers */
@@ -72,25 +77,27 @@ enum class messaging_verb : int32_t {
     READ_MUTATION_DATA = 4,
     READ_DIGEST = 5,
     // Used by gossip
-    GOSSIP_ECHO = 6,
-    GOSSIP_DIGEST_SYN = 7,
+    GOSSIP_DIGEST_SYN = 6,
+    GOSSIP_DIGEST_ACK = 7,
     GOSSIP_DIGEST_ACK2 = 8,
-    GOSSIP_SHUTDOWN = 9,
+    GOSSIP_ECHO = 9,
+    GOSSIP_SHUTDOWN = 10,
     // end of gossip verb
-    DEFINITIONS_UPDATE = 10,
-    TRUNCATE = 11,
-    REPLICATION_FINISHED = 12,
-    MIGRATION_REQUEST = 13,
+    DEFINITIONS_UPDATE = 11,
+    TRUNCATE = 12,
+    REPLICATION_FINISHED = 13,
+    MIGRATION_REQUEST = 14,
     // Used by streaming
-    PREPARE_MESSAGE = 14,
-    PREPARE_DONE_MESSAGE = 15,
-    STREAM_MUTATION = 16,
-    STREAM_MUTATION_DONE = 17,
-    COMPLETE_MESSAGE = 18,
+    PREPARE_MESSAGE = 15,
+    PREPARE_DONE_MESSAGE = 16,
+    STREAM_MUTATION = 17,
+    STREAM_MUTATION_DONE = 18,
+    COMPLETE_MESSAGE = 19,
     // end of streaming verbs
-    REPAIR_CHECKSUM_RANGE = 19,
-    GET_SCHEMA_VERSION = 20,
-    LAST = 21,
+    REPAIR_CHECKSUM_RANGE = 20,
+    GET_SCHEMA_VERSION = 21,
+    SCHEMA_CHECK = 22,
+    LAST = 23,
 };
 
 } // namespace net
@@ -107,172 +114,7 @@ public:
 
 namespace net {
 
-// NOTE: operator(input_stream<char>&, T&) takes a reference to uninitialized
-//       T object and should use placement new in case T is non POD
-struct serializer {
-    template <typename T, typename Input>
-    inline T read_integral(Input& input) const {
-        static_assert(std::is_integral<T>::value, "T should be integral");
-        T data;
-        input.read(reinterpret_cast<char*>(&data), sizeof(T));
-        return net::ntoh(data);
-    }
-
-    template <typename T, typename Output>
-    inline void write_integral(Output& output, T data) const {
-        static_assert(std::is_integral<T>::value, "T should be integral");
-        data = net::hton(data);
-        output.write(reinterpret_cast<const char*>(&data), sizeof(T));
-    }
-
-    // Adaptor for writing objects having db::serializer<>
-    template <typename Serializable, typename Output>
-    inline void write_serializable(Output& out, const Serializable& v) const {
-        db::serializer<Serializable> ser(v);
-        bytes b(bytes::initialized_later(), ser.size() + data_output::serialized_size<uint32_t>());
-        data_output d_out(b);
-        d_out.write<uint32_t>(ser.size());
-        ser.write(d_out);
-        return out.write(reinterpret_cast<const char*>(b.c_str()), b.size());
-    }
-
-    // Adaptor for reading objects having db::serializer<>
-    template <typename Serializable, typename Input>
-    inline Serializable read_serializable(Input& in) const {
-        auto sz = read_integral<uint32_t>(in);
-        bytes data(bytes::initialized_later(), sz);
-        in.read(reinterpret_cast<char*>(data.begin()), sz);
-        data_input din(data);
-        return db::serializer<Serializable>::read(din);
-    }
-
-    // For integer type
-    template <typename Input>
-    bool read(Input& input, rpc::type<bool>) const { return read(input, rpc::type<uint8_t>()); }
-    template <typename Input>
-    int8_t read(Input& input, rpc::type<int8_t>) const { return read_integral<int8_t>(input); }
-    template <typename Input>
-    uint8_t read(Input& input, rpc::type<uint8_t>) const { return read_integral<uint8_t>(input); }
-    template <typename Input>
-    int16_t read(Input& input, rpc::type<int16_t>) const { return read_integral<int16_t>(input); }
-    template <typename Input>
-    uint16_t read(Input& input, rpc::type<uint16_t>) const { return read_integral<uint16_t>(input); }
-    template <typename Input>
-    int32_t read(Input& input, rpc::type<int32_t>) const { return read_integral<int32_t>(input); }
-    template <typename Input>
-    uint32_t read(Input& input, rpc::type<uint32_t>) const { return read_integral<uint32_t>(input); }
-    template <typename Input>
-    int64_t read(Input& input, rpc::type<int64_t>) const { return read_integral<int64_t>(input); }
-    template <typename Input>
-    uint64_t read(Input& input, rpc::type<uint64_t>) const { return read_integral<uint64_t>(input); }
-    template <typename Output>
-    void write(Output& output, bool data) const { write(output, uint8_t(data)); }
-    template <typename Output>
-    void write(Output& output, int8_t data) const { write_integral(output, data); }
-    template <typename Output>
-    void write(Output& output, uint8_t data) const { write_integral(output, data); }
-    template <typename Output>
-    void write(Output& output, int16_t data) const { write_integral(output, data); }
-    template <typename Output>
-    void write(Output& output, uint16_t data) const { write_integral(output, data); }
-    template <typename Output>
-    void write(Output& output, int32_t data) const { write_integral(output, data); }
-    template <typename Output>
-    void write(Output& output, uint32_t data) const { write_integral(output, data); }
-    template <typename Output>
-    void write(Output& output, int64_t data) const { write_integral(output, data); }
-    template <typename Output>
-    void write(Output& output, uint64_t data) const { write_integral(output, data); }
-
-    // For messaging_verb
-    template <typename Output>
-    void write(Output& out, messaging_verb v) const {
-        return write(out, std::underlying_type_t<messaging_verb>(v));
-    }
-    template <typename Input>
-    messaging_verb operator()(Input& in, rpc::type<messaging_verb>) const {
-        return messaging_verb(read(in, rpc::type<std::underlying_type_t<messaging_verb>>()));
-    }
-
-    // For sstring
-    template <typename Output>
-    void write(Output& out, const sstring& v) const {
-        write(out, uint32_t(v.size()));
-        out.write(v.begin(), v.size());
-    }
-    template <typename Input>
-    sstring read(Input& in, rpc::type<sstring>) const {
-        auto sz = read(in, rpc::type<uint32_t>());
-        sstring v(sstring::initialized_later(), sz);
-        in.read(v.begin(), sz);
-        return v;
-    }
-
-    // For frozen_schema
-    template <typename Output>
-    void write(Output& out, const frozen_schema& v) const{
-        return write_serializable(out, v);
-    }
-    template <typename Input>
-    frozen_schema read(Input& in, rpc::type<frozen_schema>) const {
-        return read_serializable<frozen_schema>(in);
-    }
-
-    template <typename Output>
-    void write(Output& out, const query::result& v) const;
-    template <typename Input>
-    query::result read(Input& in, rpc::type<query::result>) const;
-
-
-    // Default implementation for any type which knows how to serialize itself
-    // with methods serialize(), deserialize() and serialized_size() with the
-    // following signatures:
-    //     void serialize(bytes::iterator& out) const;
-    //     size_t serialized_size() const;
-    //     static T deserialize(bytes_view& in);
-    //
-    // One inefficiency inherent in this API is that deserialize() expects
-    // the serialized data to have been already read into a contiguous buffer,
-    // and to do this, the reader needs to know in advance how much to read,
-    // so we are forced to precede the serialized data by its length - even
-    // though the deserialize() function should already know where to stop.
-    // Even a fixed-length object will end up preceeded by its length.
-    // This waste can be avoided by implementing special read()/write()
-    // functions for this type, above.
-    template <typename T, typename Output>
-    void write(Output& out, const T& v) const {
-        uint32_t sz = v.serialized_size();
-        write(out, sz);
-        bytes b(bytes::initialized_later(), sz);
-        auto _out = b.begin();
-        v.serialize(_out);
-        out.write(reinterpret_cast<const char*>(b.c_str()), sz);
-    }
-    template <typename T, typename Input>
-    T read(Input& in, rpc::type<T>) const {
-        auto sz = read(in, rpc::type<uint32_t>());
-        bytes b(bytes::initialized_later(), sz);
-        in.read(reinterpret_cast<char*>(b.begin()), sz);
-        bytes_view bv(b);
-        return T::deserialize(bv);
-    }
-
-};
-
-// thunk from new-style free function serialization to old-style member function
-template <typename Output, typename T>
-inline
-void
-write(serializer s, Output& out, const T& data) {
-    s.write(out, data);
-}
-
-template <typename Input, typename T>
-inline
-T
-read(serializer s, Input& in, rpc::type<T> type) {
-    return s.read(in, type);
-}
+struct serializer {};
 
 struct msg_addr {
     gms::inet_address addr;
@@ -297,7 +139,7 @@ public:
     using UUID = utils::UUID;
     using clients_map = std::unordered_map<msg_addr, shard_info, msg_addr::hash>;
 
-    // FIXME: messaging service versioning
+    // This should change only if serialization format changes
     static constexpr int32_t current_version = 0;
 
     struct shard_info {
@@ -336,8 +178,9 @@ private:
     std::unique_ptr<rpc_protocol_server_wrapper> _server;
     ::shared_ptr<seastar::tls::server_credentials> _credentials;
     std::unique_ptr<rpc_protocol_server_wrapper> _server_tls;
-    std::array<clients_map, 2> _clients;
+    std::array<clients_map, 3> _clients;
     uint64_t _dropped_messages[static_cast<int32_t>(messaging_verb::LAST)] = {};
+    bool _stopping = false;
 public:
     using clock_type = std::chrono::steady_clock;
 public:
@@ -350,15 +193,16 @@ public:
     gms::inet_address listen_address();
     future<> stop();
     static rpc::no_wait_type no_wait();
+    bool is_stopping() { return _stopping; }
 public:
     gms::inet_address get_preferred_ip(gms::inet_address ep);
     future<> init_local_preferred_ip_cache();
     void cache_preferred_ip(gms::inet_address ep, gms::inet_address ip);
 
     // Wrapper for PREPARE_MESSAGE verb
-    void register_prepare_message(std::function<future<streaming::messages::prepare_message> (const rpc::client_info& cinfo,
-            streaming::messages::prepare_message msg, UUID plan_id, sstring description)>&& func);
-    future<streaming::messages::prepare_message> send_prepare_message(msg_addr id, streaming::messages::prepare_message msg, UUID plan_id,
+    void register_prepare_message(std::function<future<streaming::prepare_message> (const rpc::client_info& cinfo,
+            streaming::prepare_message msg, UUID plan_id, sstring description)>&& func);
+    future<streaming::prepare_message> send_prepare_message(msg_addr id, streaming::prepare_message msg, UUID plan_id,
             sstring description);
 
     // Wrapper for PREPARE_DONE_MESSAGE verb
@@ -376,9 +220,9 @@ public:
     future<> send_complete_message(msg_addr id, UUID plan_id, unsigned dst_cpu_id);
 
     // Wrapper for REPAIR_CHECKSUM_RANGE verb
-    void register_repair_checksum_range(std::function<future<partition_checksum> (sstring keyspace, sstring cf, query::range<dht::token> range)>&& func);
+    void register_repair_checksum_range(std::function<future<partition_checksum> (sstring keyspace, sstring cf, range<dht::token> range)>&& func);
     void unregister_repair_checksum_range();
-    future<partition_checksum> send_repair_checksum_range(msg_addr id, sstring keyspace, sstring cf, query::range<dht::token> range);
+    future<partition_checksum> send_repair_checksum_range(msg_addr id, sstring keyspace, sstring cf, range<dht::token> range);
 
     // Wrapper for GOSSIP_ECHO verb
     void register_gossip_echo(std::function<future<> ()>&& func);
@@ -391,9 +235,14 @@ public:
     future<> send_gossip_shutdown(msg_addr id, inet_address from);
 
     // Wrapper for GOSSIP_DIGEST_SYN
-    void register_gossip_digest_syn(std::function<future<gms::gossip_digest_ack> (gms::gossip_digest_syn)>&& func);
+    void register_gossip_digest_syn(std::function<rpc::no_wait_type (const rpc::client_info& cinfo, gms::gossip_digest_syn)>&& func);
     void unregister_gossip_digest_syn();
-    future<gms::gossip_digest_ack> send_gossip_digest_syn(msg_addr id, gms::gossip_digest_syn msg);
+    future<> send_gossip_digest_syn(msg_addr id, gms::gossip_digest_syn msg);
+
+    // Wrapper for GOSSIP_DIGEST_ACK
+    void register_gossip_digest_ack(std::function<rpc::no_wait_type (const rpc::client_info& cinfo, gms::gossip_digest_ack)>&& func);
+    void unregister_gossip_digest_ack();
+    future<> send_gossip_digest_ack(msg_addr id, gms::gossip_digest_ack msg);
 
     // Wrapper for GOSSIP_DIGEST_ACK2
     void register_gossip_digest_ack2(std::function<rpc::no_wait_type (gms::gossip_digest_ack2)>&& func);
@@ -428,22 +277,27 @@ public:
     // Note: WTH is future<foreign_ptr<lw_shared_ptr<query::result>>
     void register_read_data(std::function<future<foreign_ptr<lw_shared_ptr<query::result>>> (const rpc::client_info&, query::read_command cmd, query::partition_range pr)>&& func);
     void unregister_read_data();
-    future<query::result> send_read_data(msg_addr id, const query::read_command& cmd, const query::partition_range& pr);
+    future<query::result> send_read_data(msg_addr id, clock_type::time_point timeout, const query::read_command& cmd, const query::partition_range& pr);
 
     // Wrapper for GET_SCHEMA_VERSION
     void register_get_schema_version(std::function<future<frozen_schema>(unsigned, table_schema_version)>&& func);
     void unregister_get_schema_version();
     future<frozen_schema> send_get_schema_version(msg_addr, table_schema_version);
 
+    // Wrapper for SCHEMA_CHECK
+    void register_schema_check(std::function<future<utils::UUID>()>&& func);
+    void unregister_schema_check();
+    future<utils::UUID> send_schema_check(msg_addr);
+
     // Wrapper for READ_MUTATION_DATA
     void register_read_mutation_data(std::function<future<foreign_ptr<lw_shared_ptr<reconcilable_result>>> (const rpc::client_info&, query::read_command cmd, query::partition_range pr)>&& func);
     void unregister_read_mutation_data();
-    future<reconcilable_result> send_read_mutation_data(msg_addr id, const query::read_command& cmd, const query::partition_range& pr);
+    future<reconcilable_result> send_read_mutation_data(msg_addr id, clock_type::time_point timeout, const query::read_command& cmd, const query::partition_range& pr);
 
     // Wrapper for READ_DIGEST
     void register_read_digest(std::function<future<query::result_digest> (const rpc::client_info&, query::read_command cmd, query::partition_range pr)>&& func);
     void unregister_read_digest();
-    future<query::result_digest> send_read_digest(msg_addr id, const query::read_command& cmd, const query::partition_range& pr);
+    future<query::result_digest> send_read_digest(msg_addr id, clock_type::time_point timeout, const query::read_command& cmd, const query::partition_range& pr);
 
     // Wrapper for TRUNCATE
     void register_truncate(std::function<future<>(sstring, sstring)>&& func);
@@ -475,5 +329,4 @@ inline messaging_service& get_local_messaging_service() {
     return _the_messaging_service.local();
 }
 
-future<> init_messaging_service(sstring listen_address, db::seed_provider_type seed_provider);
 } // namespace net

@@ -54,6 +54,23 @@ namespace sstables {
         Index_build = 4,
     };
 
+    static inline sstring compaction_name(compaction_type type) {
+        switch (type) {
+        case compaction_type::Compaction:
+            return "COMPACTION";
+        case compaction_type::Cleanup:
+            return "CLEANUP";
+        case compaction_type::Validation:
+            return "VALIDATION";
+        case compaction_type::Scrub:
+            return "SCRUB";
+        case compaction_type::Index_build:
+            return "INDEX_BUILD";
+        default:
+            throw std::runtime_error("Invalid Compaction Type");
+        }
+    }
+
     struct compaction_info {
         compaction_type type;
         sstring ks;
@@ -64,18 +81,20 @@ namespace sstables {
         uint64_t total_partitions = 0;
         uint64_t total_keys_written = 0;
         std::vector<shared_sstable> new_sstables;
-        bool stop_requested = false;
+        sstring stop_requested;
 
         bool is_stop_requested() const {
-            return stop_requested;
+            return stop_requested.size() > 0;
         }
 
-        void stop() {
-            stop_requested = true;
+        void stop(sstring reason) {
+            stop_requested = std::move(reason);
         }
     };
 
     // Compact a list of N sstables into M sstables.
+    // Returns a vector with newly created sstables(s).
+    //
     // creator is used to get a sstable object for a new sstable that will be written.
     // max_sstable_size is a relaxed limit size for a sstable to be generated.
     // Example: It's okay for the size of a new sstable to go beyond max_sstable_size
@@ -84,7 +103,7 @@ namespace sstables {
     // If cleanup is true, mutation that doesn't belong to current node will be
     // cleaned up, log messages will inform the user that compact_sstables runs for
     // cleaning operation, and compaction history will not be updated.
-    future<> compact_sstables(std::vector<shared_sstable> sstables,
+    future<std::vector<shared_sstable>> compact_sstables(std::vector<shared_sstable> sstables,
             column_family& cf, std::function<shared_sstable()> creator,
             uint64_t max_sstable_size, uint32_t sstable_level, bool cleanup = false);
 

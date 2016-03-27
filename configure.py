@@ -25,6 +25,31 @@ from distutils.spawn import find_executable
 
 configure_args = str.join(' ', [shlex.quote(x) for x in sys.argv[1:]])
 
+for line in open('/etc/os-release'):
+    key, _, value = line.partition('=')
+    value = value.strip().strip('"')
+    if key == 'ID':
+        os_ids = [value]
+    if key == 'ID_LIKE':
+        os_ids += value.split(' ')
+
+# distribution "internationalization", converting package names.
+# Fedora name is key, values is distro -> package name dict. 
+i18n_xlat = {
+    'boost-devel': {
+        'debian': 'libboost-dev',
+        'ubuntu': 'libboost-dev (libboost1.55-dev on 14.04)',
+    },
+}
+
+def pkgname(name):
+    if name in i18n_xlat:
+        dict = i18n_xlat[name]
+        for id in os_ids:
+            if id in dict:
+                return dict[id]
+    return name 
+
 def get_flags():
     with open('/proc/cpuinfo') as f:
         for line in f:
@@ -167,7 +192,6 @@ scylla_tests = [
     'tests/commitlog_test',
     'tests/cartesian_product_test',
     'tests/hash_test',
-    'tests/serializer_test',
     'tests/map_difference_test',
     'tests/message',
     'tests/gossip',
@@ -190,6 +214,7 @@ scylla_tests = [
     'tests/flush_queue_test',
     'tests/dynamic_bitset_test',
     'tests/auth_test',
+    'tests/idl_test',
 ]
 
 apps = [
@@ -198,7 +223,11 @@ apps = [
 
 tests = scylla_tests
 
-all_artifacts = apps + tests
+other = [
+    'iotune',
+    ]
+
+all_artifacts = apps + tests + other
 
 arg_parser = argparse.ArgumentParser('Configure scylla')
 arg_parser.add_argument('--static', dest = 'static', action = 'store_const', default = '',
@@ -235,7 +264,6 @@ add_tristate(arg_parser, name = 'xen', dest = 'xen', help = 'Xen support')
 args = arg_parser.parse_args()
 
 defines = []
-scylla_libs = '-llz4 -lsnappy -lz -lboost_thread -lcryptopp -lrt -lyaml-cpp -lboost_date_time'
 
 extra_cxxflags = {}
 
@@ -289,6 +317,7 @@ scylla_core = (['database.cc',
                  'cql3/statements/cf_statement.cc',
                  'cql3/statements/create_keyspace_statement.cc',
                  'cql3/statements/create_table_statement.cc',
+                 'cql3/statements/create_type_statement.cc',
                  'cql3/statements/drop_keyspace_statement.cc',
                  'cql3/statements/drop_table_statement.cc',
                  'cql3/statements/schema_altering_statement.cc',
@@ -317,6 +346,7 @@ scylla_core = (['database.cc',
                  'utils/big_decimal.cc',
                  'types.cc',
                  'validation.cc',
+                 'service/priority_manager.cc',
                  'service/migration_manager.cc',
                  'service/storage_proxy.cc',
                  'cql3/operator.cc',
@@ -342,7 +372,7 @@ scylla_core = (['database.cc',
                  'db/schema_tables.cc',
                  'db/commitlog/commitlog.cc',
                  'db/commitlog/commitlog_replayer.cc',
-                 'db/serializer.cc',
+                 'db/commitlog/commitlog_entry.cc',
                  'db/config.cc',
                  'db/index/secondary_index.cc',
                  'db/marshal/type_parser.cc',
@@ -356,6 +386,8 @@ scylla_core = (['database.cc',
                  'utils/rate_limiter.cc',
                  'utils/file_lock.cc',
                  'utils/dynamic_bitset.cc',
+                 'utils/managed_bytes.cc',
+                 'utils/exceptions.cc',
                  'gms/version_generator.cc',
                  'gms/versioned_value.cc',
                  'gms/gossiper.cc',
@@ -377,6 +409,7 @@ scylla_core = (['database.cc',
                  'locator/simple_strategy.cc',
                  'locator/local_strategy.cc',
                  'locator/network_topology_strategy.cc',
+                 'locator/everywhere_replication_strategy.cc',
                  'locator/token_metadata.cc',
                  'locator/locator.cc',
                  'locator/snitch_base.cc',
@@ -390,7 +423,6 @@ scylla_core = (['database.cc',
                  'service/client_state.cc',
                  'service/migration_task.cc',
                  'service/storage_service.cc',
-                 'service/pending_range_calculator_service.cc',
                  'service/load_broadcaster.cc',
                  'service/pager/paging_state.cc',
                  'service/pager/query_pagers.cc',
@@ -406,8 +438,6 @@ scylla_core = (['database.cc',
                  'streaming/stream_coordinator.cc',
                  'streaming/stream_manager.cc',
                  'streaming/stream_result_future.cc',
-                 'streaming/messages/prepare_message.cc',
-                 'streaming/messages/outgoing_file_message.cc',
                  'streaming/stream_session_state.cc',
                  'gc_clock.cc',
                  'partition_slice_builder.cc',
@@ -459,22 +489,30 @@ api = ['api/api.cc',
        'api/api-doc/system.json',
        'api/system.cc'
        ]
+
 idls = ['idl/gossip_digest.idl.hh',
-                  'idl/uuid.idl.hh',
-                  'idl/range.idl.hh',
-                  'idl/keys.idl.hh',
-                  'idl/read_command.idl.hh',
-                  'idl/token.idl.hh',
-                  'idl/ring_position.idl.hh',
-                  'idl/result.idl.hh',
-                  'idl/frozen_mutation.idl.hh',
-                  'idl/reconcilable_result.idl.hh',
-                  'idl/streaming.idl.hh',
-          ]
+        'idl/uuid.idl.hh',
+        'idl/range.idl.hh',
+        'idl/keys.idl.hh',
+        'idl/read_command.idl.hh',
+        'idl/token.idl.hh',
+        'idl/ring_position.idl.hh',
+        'idl/result.idl.hh',
+        'idl/frozen_mutation.idl.hh',
+        'idl/reconcilable_result.idl.hh',
+        'idl/streaming.idl.hh',
+        'idl/paging_state.idl.hh',
+        'idl/frozen_schema.idl.hh',
+        'idl/partition_checksum.idl.hh',
+        'idl/replay_position.idl.hh',
+        'idl/truncation_record.idl.hh',
+        'idl/mutation.idl.hh',
+        'idl/query.idl.hh',
+        'idl/idl_test.idl.hh',
+        'idl/commitlog.idl.hh',
+        ]
 
-serialize = idls + ['serializer.inc.hh']
-
-scylla_tests_dependencies = scylla_core + api + serialize + [
+scylla_tests_dependencies = scylla_core + api + idls + [
     'tests/cql_test_env.cc',
     'tests/cql_assertions.cc',
     'tests/result_set_assertions.cc',
@@ -487,7 +525,7 @@ scylla_tests_seastar_deps = [
 ]
 
 deps = {
-    'scylla': serialize + ['main.cc'] + scylla_core + api,
+    'scylla': idls + ['main.cc'] + scylla_core + api,
 }
 
 tests_not_using_seastar_test_framework = set([
@@ -515,6 +553,7 @@ tests_not_using_seastar_test_framework = set([
     'tests/perf/perf_sstable',
     'tests/managed_vector_test',
     'tests/dynamic_bitset_test',
+    'tests/idl_test',
 ])
 
 for t in tests_not_using_seastar_test_framework:
@@ -557,16 +596,44 @@ else:
     args.pie = ''
     args.fpie = ''
 
-optional_packages = ['libsystemd']
+# a list element means a list of alternative packages to consider
+# the first element becomes the HAVE_pkg define
+# a string element is a package name with no alternatives
+optional_packages = [['libsystemd', 'libsystemd-daemon']]
 pkgs = []
 
-for pkg in optional_packages:
-    if have_pkg(pkg):
-        pkgs.append(pkg)
-        upkg = pkg.upper().replace('-', '_')
-        defines.append('HAVE_{}=1'.format(upkg))
-    else:
-        print('Missing optional package {pkg}'.format(**locals()))
+def setup_first_pkg_of_list(pkglist):
+    # The HAVE_pkg symbol is taken from the first alternative
+    upkg = pkglist[0].upper().replace('-', '_')
+    for pkg in pkglist:
+        if have_pkg(pkg):
+            pkgs.append(pkg)
+            defines.append('HAVE_{}=1'.format(upkg))
+            return True
+    return False
+
+for pkglist in optional_packages:
+    if isinstance(pkglist, str):
+        pkglist = [pkglist]
+    if not setup_first_pkg_of_list(pkglist):
+        if len(pkglist) == 1:
+            print('Missing optional package {pkglist[0]}'.format(**locals()))
+        else:
+            alternatives = ':'.join(pkglist[1:])
+            print('Missing optional package {pkglist[0]} (or alteratives {alternatives})'.format(**locals()))
+
+if not try_compile(compiler=args.cxx, source='#include <boost/version.hpp>'):
+    print('Boost not installed.  Please install {}.'.format(pkgname("boost-devel")))
+    sys.exit(1)
+
+if not try_compile(compiler=args.cxx, source='''\
+        #include <boost/version.hpp>
+        #if BOOST_VERSION < 105500
+        #error Boost version too low
+        #endif
+        '''):
+    print('Installed boost version too old.  Please update {}.'.format(pkgname("boost-devel")))
+    sys.exit(1)
 
 defines = ' '.join(['-D' + d for d in defines])
 
@@ -596,6 +663,8 @@ if args.dpdk:
     seastar_flags += ['--enable-dpdk']
 elif args.dpdk_target:
     seastar_flags += ['--dpdk-target', args.dpdk_target]
+if args.staticcxx:
+    seastar_flags += ['--static-stdc++']
 
 seastar_cflags = args.user_cflags + " -march=nehalem"
 seastar_flags += ['--compiler', args.cxx, '--cflags=%s' % (seastar_cflags)]
@@ -629,7 +698,7 @@ for mode in build_modes:
 seastar_deps = 'practically_anything_can_change_so_lets_run_it_every_time_and_restat.'
 
 args.user_cflags += " " + pkg_config("--cflags", "jsoncpp")
-libs = "-lyaml-cpp -llz4 -lz -lsnappy " + pkg_config("--libs", "jsoncpp") + ' -lboost_filesystem' + ' -lcrypt'
+libs = "-lyaml-cpp -llz4 -lz -lsnappy " + pkg_config("--libs", "jsoncpp") + ' -lboost_filesystem' + ' -lcrypt' + ' -lboost_date_time'
 for pkg in pkgs:
     args.user_cflags += ' ' + pkg_config('--cflags', pkg)
     libs += ' ' + pkg_config('--libs', pkg)
@@ -665,15 +734,15 @@ with open(buildfile, 'w') as f:
             command = seastar/json/json2code.py -f $in -o $out
             description = SWAGGER $out
         rule serializer
-            command = ./idl-compiler.py --ns ser -f $in -o $out
+            command = {python} ./idl-compiler.py --ns ser -f $in -o $out
             description = IDL compiler $out
-        rule serializer_inc
-            command = ./idl-compiler.py $in -o $out
-            description = Combine IDLs $out
         rule ninja
             command = {ninja} -C $subdir $target
             restat = 1
             description = NINJA $out
+        rule copy
+            command = cp $in $out
+            description = COPY $out
         ''').format(**globals()))
     for mode in build_modes:
         modeval = modes[mode]
@@ -707,10 +776,11 @@ with open(buildfile, 'w') as f:
         ragels = {}
         swaggers = {}
         serializers = {}
-        serializer_inc = {}
         thrifts = set()
         antlr3_grammars = set()
         for binary in build_artifacts:
+            if binary in other:
+                continue
             srcs = deps[binary]
             objs = ['$builddir/' + mode + '/' + src.replace('.cc', '.o')
                     for src in srcs
@@ -764,9 +834,6 @@ with open(buildfile, 'w') as f:
                 elif src.endswith('.idl.hh'):
                     hh = '$builddir/' + mode + '/gen/' + src.replace('.idl.hh', '.dist.hh')
                     serializers[hh] = src
-                elif src.endswith('.inc.hh'):
-                    hh = '$builddir/' + mode + '/gen/' + src
-                    serializer_inc[hh] = src
                 elif src.endswith('.json'):
                     hh = '$builddir/' + mode + '/gen/' + src + '.hh'
                     swaggers[hh] = src
@@ -779,14 +846,14 @@ with open(buildfile, 'w') as f:
         for obj in compiles:
             src = compiles[obj]
             gen_headers = list(ragels.keys())
-            gen_headers += ['seastar/build/{}/http/request_parser.hh'.format(mode)]
+            gen_headers += ['seastar/build/{}/gen/http/request_parser.hh'.format(mode)]
+            gen_headers += ['seastar/build/{}/gen/http/http_response_parser.hh'.format(mode)]
             for th in thrifts:
                 gen_headers += th.headers('$builddir/{}/gen'.format(mode))
             for g in antlr3_grammars:
                 gen_headers += g.headers('$builddir/{}/gen'.format(mode))
             gen_headers += list(swaggers.keys())
             gen_headers += list(serializers.keys())
-            gen_headers += list(serializer_inc.keys())
             f.write('build {}: cxx.{} {} || {} \n'.format(obj, mode, src, ' '.join(gen_headers)))
             if src in extra_cxxflags:
                 f.write('    cxxflags = {seastar_cflags} $cxxflags $cxxflags_{mode} {extra_cxxflags}\n'.format(mode = mode, extra_cxxflags = extra_cxxflags[src], **modeval))
@@ -798,9 +865,7 @@ with open(buildfile, 'w') as f:
             f.write('build {}: swagger {}\n'.format(hh,src))
         for hh in serializers:
             src = serializers[hh]
-            f.write('build {}: serializer {}\n'.format(hh,src))
-        for hh in serializer_inc:
-            f.write('build {}: serializer_inc {}\n'.format(hh, " ".join(serializers.keys())))
+            f.write('build {}: serializer {} | idl-compiler.py\n'.format(hh,src))
         for thrift in thrifts:
             outs = ' '.join(thrift.generated('$builddir/{}/gen'.format(mode)))
             f.write('build {}: thrift.{} {}\n'.format(outs, mode, thrift.source))
@@ -813,10 +878,14 @@ with open(buildfile, 'w') as f:
                                                                    grammar.source.rsplit('.', 1)[0]))
             for cc in grammar.sources('$builddir/{}/gen'.format(mode)):
                 obj = cc.replace('.cpp', '.o')
-                f.write('build {}: cxx.{} {}\n'.format(obj, mode, cc))
-        f.write('build seastar/build/{}/libseastar.a: ninja {}\n'.format(mode, seastar_deps))
+                f.write('build {}: cxx.{} {} || {}\n'.format(obj, mode, cc, ' '.join(serializers)))
+        f.write('build seastar/build/{mode}/libseastar.a seastar/build/{mode}/apps/iotune/iotune seastar/build/{mode}/gen/http/request_parser.hh seastar/build/{mode}/gen/http/http_response_parser.hh: ninja {seastar_deps}\n'
+                .format(**locals()))
         f.write('  subdir = seastar\n')
-        f.write('  target = build/{}/libseastar.a\n'.format(mode))
+        f.write('  target = build/{mode}/libseastar.a build/{mode}/apps/iotune/iotune build/{mode}/gen/http/request_parser.hh build/{mode}/gen/http/http_response_parser.hh\n'.format(**locals()))
+        f.write(textwrap.dedent('''\
+            build build/{mode}/iotune: copy seastar/build/{mode}/apps/iotune/iotune
+            ''').format(**locals()))
     f.write('build {}: phony\n'.format(seastar_deps))
     f.write(textwrap.dedent('''\
         rule configure
@@ -827,10 +896,6 @@ with open(buildfile, 'w') as f:
             command = find -name '*.[chS]' -o -name "*.cc" -o -name "*.hh" | cscope -bq -i-
             description = CSCOPE
         build cscope: cscope
-        rule request_parser_hh
-           command = {ninja} -C seastar build/release/gen/http/request_parser.hh build/debug/gen/http/request_parser.hh
-           description = GEN seastar/http/request_parser.hh
-        build seastar/build/release/http/request_parser.hh seastar/build/debug/http/request_parser.hh: request_parser_hh
         rule clean
             command = rm -rf build
             description = CLEAN

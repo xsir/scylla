@@ -89,7 +89,7 @@ class cql_server {
 private:
     class event_notifier;
 
-    static constexpr int current_version = 3;
+    static constexpr cql_protocol_version_type current_version = cql_serialization_format::latest_version;
 
     std::vector<server_socket> _listeners;
     distributed<service::storage_proxy>& _proxy;
@@ -107,8 +107,8 @@ private:
     cql_load_balance _lb;
 public:
     cql_server(distributed<service::storage_proxy>& proxy, distributed<cql3::query_processor>& qp, cql_load_balance lb);
-    future<> listen(ipv4_addr addr, ::shared_ptr<seastar::tls::server_credentials> = {});
-    future<> do_accepts(int which);
+    future<> listen(ipv4_addr addr, ::shared_ptr<seastar::tls::server_credentials> = {}, bool keepalive = false);
+    future<> do_accepts(int which, bool keepalive);
     future<> stop();
 public:
     class response;
@@ -122,8 +122,8 @@ private:
         output_stream<char> _write_buf;
         seastar::gate _pending_requests_gate;
         future<> _ready_to_respond = make_ready_future<>();
-        uint8_t _version = 0;
-        serialization_format _serialization_format = serialization_format::use_16_bit();
+        cql_protocol_version_type _version = 0;
+        cql_serialization_format _cql_serialization_format = cql_serialization_format::latest();
         service::client_state _client_state;
         std::unordered_map<uint16_t, cql_query_state> _query_states;
         unsigned _request_cpu = 0;
@@ -178,8 +178,7 @@ private:
         int8_t read_byte(bytes_view& buf);
         int32_t read_int(bytes_view& buf);
         int64_t read_long(bytes_view& buf);
-        int16_t read_short(bytes_view& buf);
-        uint16_t read_unsigned_short(bytes_view& buf);
+        uint16_t read_short(bytes_view& buf);
         sstring read_string(bytes_view& buf);
         sstring_view read_string_view(bytes_view& buf);
         sstring_view read_long_string_view(bytes_view& buf);
@@ -192,8 +191,9 @@ private:
         db::consistency_level read_consistency(bytes_view& buf);
         std::unordered_map<sstring, sstring> read_string_map(bytes_view& buf);
         std::unique_ptr<cql3::query_options> read_options(bytes_view& buf);
+        std::unique_ptr<cql3::query_options> read_options(bytes_view& buf, uint8_t);
 
-        void init_serialization_format();
+        void init_cql_serialization_format();
 
         friend event_notifier;
     };

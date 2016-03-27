@@ -98,6 +98,7 @@ public:
         uint64_t queued_write_bytes = 0;
         uint64_t reads = 0;
         uint64_t background_reads = 0; // client no longer waits for the read
+        uint64_t read_retries = 0; // read is retried with new limit
     };
 private:
     distributed<database>& _db;
@@ -121,7 +122,6 @@ private:
     std::uniform_real_distribution<> _read_repair_chance = std::uniform_real_distribution<>(0,1);
     std::unique_ptr<scollectd::registrations> _collectd_registrations;
 private:
-    void init_messaging_service();
     void uninit_messaging_service();
     future<foreign_ptr<lw_shared_ptr<query::result>>> query_singular(lw_shared_ptr<query::read_command> cmd, std::vector<query::partition_range>&& partition_ranges, db::consistency_level cl);
     response_id_type register_response_handler(std::unique_ptr<abstract_write_response_handler>&& h);
@@ -143,7 +143,8 @@ private:
     std::vector<gms::inet_address> get_live_sorted_endpoints(keyspace& ks, const dht::token& token);
     db::read_repair_decision new_read_repair_decision(const schema& s);
     ::shared_ptr<abstract_read_executor> get_read_executor(lw_shared_ptr<query::read_command> cmd, query::partition_range pr, db::consistency_level cl);
-    future<foreign_ptr<lw_shared_ptr<query::result>>> query_singular_local(schema_ptr, lw_shared_ptr<query::read_command> cmd, const query::partition_range& pr);
+    future<foreign_ptr<lw_shared_ptr<query::result>>> query_singular_local(schema_ptr, lw_shared_ptr<query::read_command> cmd, const query::partition_range& pr,
+                                                                           query::result_request request = query::result_request::result_and_digest);
     future<query::result_digest> query_singular_local_digest(schema_ptr, lw_shared_ptr<query::read_command> cmd, const query::partition_range& pr);
     future<foreign_ptr<lw_shared_ptr<query::result>>> query_partition_key_range(lw_shared_ptr<query::read_command> cmd, query::partition_range&& range, db::consistency_level cl);
     std::vector<query::partition_range> get_restricted_ranges(keyspace& ks, const schema& s, query::partition_range range);
@@ -165,6 +166,7 @@ private:
     future<> schedule_repair(std::unordered_map<gms::inet_address, std::vector<mutation>> diffs);
     bool need_throttle_writes() const;
     void unthrottle();
+    void handle_read_error(std::exception_ptr eptr);
 
 public:
     storage_proxy(distributed<database>& db);
@@ -173,9 +175,13 @@ public:
         return _db;
     }
 
+    void init_messaging_service();
+
     future<> mutate_locally(const mutation& m);
     future<> mutate_locally(const schema_ptr&, const frozen_mutation& m);
     future<> mutate_locally(std::vector<mutation> mutations);
+
+    future<> mutate_streaming_mutation(const schema_ptr&, const frozen_mutation& m);
 
     /**
     * Use this method to have these Mutations applied
@@ -229,7 +235,8 @@ public:
      * which combines data from all shards.
      * Uses schema current at the time of invocation.
      */
-    mutation_reader make_local_reader(utils::UUID cf_id, const query::partition_range&);
+    mutation_reader make_local_reader(utils::UUID cf_id, const query::partition_range&,
+                                      const io_priority_class& pc = default_priority_class());
 
     future<> stop();
 

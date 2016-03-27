@@ -192,7 +192,7 @@ public:
     /* Before starting a node for the first time, you should carefully evaluate your requirements. */   \
     /* Common initialization properties */  \
     /* Note: Be sure to set the properties in the Quick start section as well. */   \
-    val(commit_failure_policy, sstring, "stop", Unused, \
+    val(commit_failure_policy, sstring, "stop", Used, \
             "Policy for commit disk failures:\n"    \
             "\n"    \
             "\tdie          Shut down gossip and Thrift and kill the JVM, so the node can be replaced.\n"   \
@@ -201,7 +201,7 @@ public:
             "\tignore       Ignore fatal errors and let the batches fail."\
             , "die", "stop", "stop_commit", "ignore"    \
     )   \
-    val(disk_failure_policy, sstring, "stop", Unused, \
+    val(disk_failure_policy, sstring, "stop", Used, \
             "Sets how Cassandra responds to disk failure. Recommend settings are stop or best_effort.\n"    \
             "\n"    \
             "\tdie              Shut down gossip and Thrift and kill the JVM for any file system errors or single SSTable errors, so the node can be replaced.\n"   \
@@ -487,7 +487,7 @@ public:
     val(cas_contention_timeout_in_ms, uint32_t, 5000, Unused,     \
             "The time that the coordinator continues to retry a CAS (compare and set) operation that contends with other proposals for the same row."  \
     )   \
-    val(truncate_request_timeout_in_ms, uint32_t, 10000, Unused,     \
+    val(truncate_request_timeout_in_ms, uint32_t, 10000, Used,     \
             "The time that the coordinator waits for truncates (remove all data from a table) to complete. The long default value allows for a snapshot to be taken before removing the data. If auto_snapshot is disabled (not recommended), you can reduce this time."  \
     )   \
     val(write_request_timeout_in_ms, uint32_t, 2000, Used,     \
@@ -556,7 +556,7 @@ public:
     val(start_rpc, bool, false, Used,                \
             "Starts the Thrift RPC server"  \
     )   \
-    val(rpc_keepalive, bool, true, Unused,     \
+    val(rpc_keepalive, bool, true, Used,     \
             "Enable or disable keepalive on client connections (RPC or native)."  \
     )   \
     val(rpc_max_threads, uint32_t, 0, Invalid,     \
@@ -718,6 +718,7 @@ public:
     val(replace_address_first_boot, sstring, "", Used, "Like replace_address option, but if the node has been bootstrapped sucessfully it will be ignored. Same as -Dcassandra.replace_address_first_boot.") \
     val(override_decommission, bool, false, Used, "Set true to force a decommissioned node to join the cluster") \
     val(ring_delay_ms, uint32_t, 30 * 1000, Used, "Time a node waits to hear from other nodes before joining the ring in milliseconds. Same as -Dcassandra.ring_delay_ms in cassandra.") \
+    val(shutdown_announce_in_ms, uint32_t, 2 * 1000, Used, "Time a node waits after sending gossip shutdown message in milliseconds. Same as -Dcassandra.shutdown_announce_in_ms in cassandra.") \
     val(developer_mode, bool, false, Used, "Relax environement checks. Setting to true can reduce performance and reliability significantly.") \
     val(skip_wait_for_gossip_to_settle, int32_t, -1, Used, "An integer to configure the wait for gossip to settle. -1: wait normally, 0: do not wait at all, n: wait for at most n polls. Same as -Dcassandra.skip_wait_for_gossip_to_settle in cassandra.") \
     val(experimental, bool, false, Used, "Set to true to unlock experimental features.") \

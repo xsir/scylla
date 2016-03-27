@@ -22,6 +22,9 @@ fi
 if [ ! -f /usr/bin/add-apt-repository ]; then
     sudo apt-get -y install software-properties-common
 fi
+if [ ! -f /usr/bin/wget ]; then
+    sudo apt-get -y install wget
+fi
 
 RELEASE=`lsb_release -r|awk '{print $2}'`
 CODENAME=`lsb_release -c|awk '{print $2}'`
@@ -32,7 +35,7 @@ if [ `grep -c $RELEASE dist/ubuntu/supported_release` -lt 1 ]; then
 fi
 
 VERSION=$(./SCYLLA-VERSION-GEN)
-SCYLLA_VERSION=$(cat build/SCYLLA-VERSION-FILE)
+SCYLLA_VERSION=$(cat build/SCYLLA-VERSION-FILE | sed 's/\.rc/~rc/')
 SCYLLA_RELEASE=$(cat build/SCYLLA-RELEASE-FILE)
 echo $VERSION > version
 ./scripts/git-archive-all --extra version --force-submodules --prefix scylla-server ../scylla-server_$SCYLLA_VERSION-$SCYLLA_RELEASE.orig.tar.gz 
@@ -43,6 +46,16 @@ cp dist/ubuntu/changelog.in debian/changelog
 sed -i -e "s/@@VERSION@@/$SCYLLA_VERSION/g" debian/changelog
 sed -i -e "s/@@RELEASE@@/$SCYLLA_RELEASE/g" debian/changelog
 sed -i -e "s/@@CODENAME@@/$CODENAME/g" debian/changelog
+cp dist/ubuntu/rules.in debian/rules
+cp dist/ubuntu/control.in debian/control
+if [ "$RELEASE" = "15.10" ]; then
+    sed -i -e "s/@@COMPILER@@/g++/g" debian/rules
+    sed -i -e "s/@@COMPILER@@/g++/g" debian/control
+else
+    sed -i -e "s/@@COMPILER@@/g++-5/g" debian/rules
+    sed -i -e "s/@@COMPILER@@/g++-5/g" debian/control
+fi
+
 
 ./dist/ubuntu/dep/build_dependency.sh
 
@@ -50,7 +63,7 @@ if [ "$RELEASE" != "15.10" ]; then
     sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
     sudo apt-get -y update
 fi
-sudo apt-get -y install g++-4.9
+sudo apt-get -y install g++-5
 echo Y | sudo mk-build-deps -i -r
 
 debuild -r fakeroot -us -uc

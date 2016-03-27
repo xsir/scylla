@@ -25,29 +25,34 @@
 #include <cryptopp/md5.h>
 #include "bytes_ostream.hh"
 #include "query-request.hh"
-#include "db/serializer.hh"
+#include "md5_hasher.hh"
+#include <experimental/optional>
+
+namespace stdx = std::experimental;
 
 namespace query {
 
+enum class result_request {
+    only_result,
+    only_digest,
+    result_and_digest,
+};
+
 class result_digest {
-    bytes _digest;
 public:
-    result_digest(bytes&& digest) : _digest(std::move(digest)) {}
-    const bytes& get() { return _digest; }
+    static_assert(16 == CryptoPP::Weak::MD5::DIGESTSIZE, "MD5 digest size is all wrong");
+    using type = std::array<uint8_t, 16>;
+private:
+    type _digest;
+public:
+    result_digest() = default;
+    result_digest(type&& digest) : _digest(std::move(digest)) {}
+    const type& get() const { return _digest; }
     bool operator==(const result_digest& rh) const {
         return _digest == rh._digest;
     }
     bool operator!=(const result_digest& rh) const {
         return _digest != rh._digest;
-    }
-    size_t serialized_size() const { return _digest.size(); }
-    void serialize(bytes::iterator& out) const {
-        out = std::copy(_digest.begin(), _digest.end(), out);
-    }
-    static result_digest deserialize(bytes_view& in) {
-        auto result = result_digest(bytes(in.begin(), in.end()));
-        in.remove_prefix(in.size());
-        return result;
     }
 };
 
@@ -80,53 +85,25 @@ public:
 // binary protocol client. So in the typical case the coordinator would just
 // pass the data using zero-copy to the client, prepending a header.
 //
-// Users which need more complex structure of query results, should
-// transform it to such using appropriate visitors.
-// TODO: insert reference to such visitors here.
-//
-// Query results have dynamic format. In some queries (maybe even in typical
-// ones), we don't need to send partition or clustering keys back to the
-// client, because they are already specified in the query request, and not
-// queried for. The query results hold keys optionally.
-//
-// Also, meta-data like cell timestamp and expiry is optional. It is only needed
-// if the query has writetime() or ttl() functions in it, which it typically
-// won't have.
+// Users which need more complex structure of query results can convert this
+// to query::result_set.
 //
 // Related headers:
 //  - query-result-reader.hh
 //  - query-result-writer.hh
 
-//
-// Query results are serialized to the following form:
-//
-// <result>          ::= <partition>*
-// <partition>       ::= <row-count> [ <partition-key> ] [ <static-row> ] <row>*
-// <static-row>      ::= <row>
-// <row>             ::= <row-length> <cell>+
-// <cell>            ::= <atomic-cell> | <collection-cell>
-// <atomic-cell>     ::= <present-byte> [ <timestamp> <expiry> ] <value>
-// <collection-cell> ::= <blob>
-//
-// <value>           ::= <blob>
-// <blob>            ::= <blob-length> <uint8_t>*
-// <timestamp>       ::= <uint64_t>
-// <expiry>          ::= <int32_t>
-// <present-byte>    ::= <int8_t>
-// <row-length>      ::= <uint32_t>
-// <row-count>       ::= <uint32_t>
-// <blob-length>     ::= <uint32_t>
-//
+
 class result {
     bytes_ostream _w;
+    stdx::optional<result_digest> _digest;
 public:
     class builder;
     class partition_writer;
-    class row_writer;
     friend class result_merger;
 
-    result() {}
+    result();
     result(bytes_ostream&& w) : _w(std::move(w)) {}
+    result(bytes_ostream&& w, stdx::optional<result_digest> d) : _w(std::move(w)), _digest(d) {}
     result(result&&) = default;
     result(const result&) = default;
     result& operator=(result&&) = default;
@@ -136,12 +113,8 @@ public:
         return _w;
     }
 
-    result_digest digest() {
-        CryptoPP::Weak::MD5 hash;
-        bytes b(bytes::initialized_later(), CryptoPP::Weak::MD5::DIGESTSIZE);
-        bytes_view v = _w.linearize();
-        hash.CalculateDigest(reinterpret_cast<unsigned char*>(b.begin()), reinterpret_cast<const unsigned char*>(v.begin()), v.size());
-        return result_digest(std::move(b));
+    const stdx::optional<result_digest>& digest() const {
+        return _digest;
     }
     sstring pretty_print(schema_ptr, const query::partition_slice&) const;
 };

@@ -66,7 +66,42 @@ migration_manager::migration_manager()
 
 future<> migration_manager::stop()
 {
+    uninit_messaging_service();
     return make_ready_future<>();
+}
+
+void migration_manager::init_messaging_service()
+{
+    auto& ms = net::get_local_messaging_service();
+    ms.register_definitions_update([this] (const rpc::client_info& cinfo, std::vector<frozen_mutation> m) {
+        auto src = net::messaging_service::get_source(cinfo);
+        do_with(std::move(m), get_local_shared_storage_proxy(), [src] (const std::vector<frozen_mutation>& mutations, shared_ptr<storage_proxy>& p) {
+            return service::get_local_migration_manager().merge_schema_from(src, mutations);
+        }).then_wrapped([src] (auto&& f) {
+            if (f.failed()) {
+                logger.error("Failed to update definitions from {}: {}", src, f.get_exception());
+            } else {
+                logger.debug("Applied definitions update from {}.", src);
+            }
+        });
+        return net::messaging_service::no_wait();
+    });
+    ms.register_migration_request([this] () {
+        return db::schema_tables::convert_schema_to_mutations(get_storage_proxy()).finally([p = get_local_shared_storage_proxy()] {
+            // keep local proxy alive
+        });
+    });
+    ms.register_schema_check([] {
+        return make_ready_future<utils::UUID>(service::get_local_storage_service().db().local().get_version());
+    });
+}
+
+void migration_manager::uninit_messaging_service()
+{
+    auto& ms = net::get_local_messaging_service();
+    ms.unregister_migration_request();
+    ms.unregister_definitions_update();
+    ms.unregister_schema_check();
 }
 
 void migration_manager::register_listener(migration_listener* listener)
@@ -197,8 +232,8 @@ bool migration_manager::should_pull_schema_from(const gms::inet_address& endpoin
             && !gms::get_local_gossiper().is_gossip_only_member(endpoint);
 }
 
-void migration_manager::notify_create_keyspace(const lw_shared_ptr<keyspace_metadata>& ksm)
-{
+future<> migration_manager::notify_create_keyspace(const lw_shared_ptr<keyspace_metadata>& ksm) {
+    return seastar::async([this, ksm] {
         auto&& name = ksm->name();
         for (auto&& listener : _listeners) {
             try {
@@ -207,10 +242,11 @@ void migration_manager::notify_create_keyspace(const lw_shared_ptr<keyspace_meta
                 logger.warn("Create keyspace notification failed {}: {}", name, std::current_exception());
             }
         }
+    });
 }
 
-void migration_manager::notify_create_column_family(const schema_ptr& cfm)
-{
+future<> migration_manager::notify_create_column_family(const schema_ptr& cfm) {
+    return seastar::async([this, cfm] {
         auto&& ks_name = cfm->ks_name();
         auto&& cf_name = cfm->cf_name();
         for (auto&& listener : _listeners) {
@@ -220,6 +256,7 @@ void migration_manager::notify_create_column_family(const schema_ptr& cfm)
                 logger.warn("Create column family notification failed {}.{}: {}", ks_name, cf_name, std::current_exception());
             }
         }
+    });
 }
 
 #if 0
@@ -242,8 +279,8 @@ public void notifyCreateAggregate(UDAggregate udf)
 }
 #endif
 
-void migration_manager::notify_update_keyspace(const lw_shared_ptr<keyspace_metadata>& ksm)
-{
+future<> migration_manager::notify_update_keyspace(const lw_shared_ptr<keyspace_metadata>& ksm) {
+    return seastar::async([this, ksm] {
         auto&& name = ksm->name();
         for (auto&& listener : _listeners) {
             try {
@@ -252,10 +289,11 @@ void migration_manager::notify_update_keyspace(const lw_shared_ptr<keyspace_meta
                 logger.warn("Update keyspace notification failed {}: {}", name, std::current_exception());
             }
         }
+    });
 }
 
-void migration_manager::notify_update_column_family(const schema_ptr& cfm, bool columns_changed)
-{
+future<> migration_manager::notify_update_column_family(const schema_ptr& cfm, bool columns_changed) {
+    return seastar::async([this, cfm, columns_changed] {
         auto&& ks_name = cfm->ks_name();
         auto&& cf_name = cfm->cf_name();
         for (auto&& listener : _listeners) {
@@ -265,6 +303,7 @@ void migration_manager::notify_update_column_family(const schema_ptr& cfm, bool 
                 logger.warn("Update column family notification failed {}.{}: {}", ks_name, cf_name, std::current_exception());
             }
         }
+    });
 }
 
 #if 0
@@ -287,8 +326,8 @@ public void notifyUpdateAggregate(UDAggregate udf)
 }
 #endif
 
-void migration_manager::notify_drop_keyspace(const sstring& ks_name)
-{
+future<> migration_manager::notify_drop_keyspace(const sstring& ks_name) {
+    return seastar::async([this, ks_name] {
         for (auto&& listener : _listeners) {
             try {
                 listener->on_drop_keyspace(ks_name);
@@ -296,10 +335,11 @@ void migration_manager::notify_drop_keyspace(const sstring& ks_name)
                 logger.warn("Drop keyspace notification failed {}: {}", ks_name, std::current_exception());
             }
         }
+    });
 }
 
-void migration_manager::notify_drop_column_family(const schema_ptr& cfm)
-{
+future<> migration_manager::notify_drop_column_family(const schema_ptr& cfm) {
+    return seastar::async([this, cfm] {
         auto&& cf_name = cfm->cf_name();
         auto&& ks_name = cfm->ks_name();
         for (auto&& listener : _listeners) {
@@ -309,6 +349,7 @@ void migration_manager::notify_drop_column_family(const schema_ptr& cfm)
                 logger.warn("Drop column family notification failed {}.{}: {}", ks_name, cf_name, std::current_exception());
             }
         }
+    });
 }
 
 #if 0
@@ -377,7 +418,7 @@ future<> migration_manager::announce_column_family_update(schema_ptr cfm, bool f
 #if 0
         oldCfm.validateCompatility(cfm);
 #endif
-        logger.info("Update table '{}/{}' From {} To {}", cfm->ks_name(), cfm->cf_name(), *old_schema, *cfm);
+        logger.info("Update table '{}.{}' From {} To {}", cfm->ks_name(), cfm->cf_name(), *old_schema, *cfm);
         auto&& keyspace = db.find_keyspace(cfm->ks_name());
         auto mutations = db::schema_tables::make_update_table_mutations(keyspace.metadata(), old_schema, cfm, api::new_timestamp(), from_thrift);
         return announce(std::move(mutations), announce_locally);
@@ -474,7 +515,7 @@ future<> migration_manager::announce_column_family_drop(const sstring& ks_name,
         auto& db = get_local_storage_proxy().get_db().local();
         auto&& old_cfm = db.find_schema(ks_name, cf_name);
         auto&& keyspace = db.find_keyspace(ks_name);
-        logger.info("Drop table '{}/{}'", old_cfm->ks_name(), old_cfm->cf_name());
+        logger.info("Drop table '{}.{}'", old_cfm->ks_name(), old_cfm->cf_name());
         auto mutations = db::schema_tables::make_drop_table_mutations(keyspace.metadata(), old_cfm, api::new_timestamp());
         return announce(std::move(mutations), announce_locally);
     } catch (const no_such_column_family& e) {

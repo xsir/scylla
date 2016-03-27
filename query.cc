@@ -20,14 +20,15 @@
  */
 
 #include <limits>
-#include "db/serializer.hh"
 #include "query-request.hh"
 #include "query-result.hh"
+#include "query-result-writer.hh"
 #include "query-result-set.hh"
 #include "to_string.hh"
 #include "bytes.hh"
-#include "mutation.hh"
 #include "mutation_partition_serializer.hh"
+#include "query-result-reader.hh"
+#include "query_result_merger.hh"
 
 namespace query {
 
@@ -44,8 +45,9 @@ std::ostream& operator<<(std::ostream& out, const partition_slice& ps) {
     if (ps._specific_ranges) {
         out << ", specific=[" << *ps._specific_ranges << "]";
     }
-    return out << ", options=" << sprint("%x", ps.options.mask()) // FIXME: pretty print options
-        << "}";
+    out << ", options=" << sprint("%x", ps.options.mask()); // FIXME: pretty print options
+    out << ", cql_format=" << ps.cql_format();
+    return out << "}";
 }
 
 std::ostream& operator<<(std::ostream& out, const read_command& r) {
@@ -61,13 +63,18 @@ std::ostream& operator<<(std::ostream& out, const specific_ranges& s) {
     return out << "{" << s._pk << " : " << join(", ", s._ranges) << "}";
 }
 
-partition_slice::partition_slice(clustering_row_ranges row_ranges, std::vector<column_id> static_columns,
-    std::vector<column_id> regular_columns, option_set options, std::unique_ptr<specific_ranges> specific_ranges)
+partition_slice::partition_slice(clustering_row_ranges row_ranges,
+    std::vector<column_id> static_columns,
+    std::vector<column_id> regular_columns,
+    option_set options,
+    std::unique_ptr<specific_ranges> specific_ranges,
+    cql_serialization_format cql_format)
     : _row_ranges(std::move(row_ranges))
     , static_columns(std::move(static_columns))
     , regular_columns(std::move(regular_columns))
     , options(options)
     , _specific_ranges(std::move(specific_ranges))
+    , _cql_format(std::move(cql_format))
 {}
 
 partition_slice::partition_slice(partition_slice&&) = default;
@@ -80,6 +87,7 @@ partition_slice::partition_slice(const partition_slice& s)
     , regular_columns(s.regular_columns)
     , options(s.options)
     , _specific_ranges(s._specific_ranges ? std::make_unique<specific_ranges>(*s._specific_ranges) : nullptr)
+    , _cql_format(s._cql_format)
 {}
 
 partition_slice::~partition_slice()
@@ -131,8 +139,47 @@ to_partition_range(query::range<dht::token> r) {
 sstring
 result::pretty_print(schema_ptr s, const query::partition_slice& slice) const {
     std::ostringstream out;
-    out << "{" << result_set::from_raw_result(s, slice, *this) << "}";
+    out << "{ result: " << result_set::from_raw_result(s, slice, *this);
+    out << " digest: ";
+    if (_digest) {
+        out << std::hex << std::setw(2);
+        for (auto&& c : _digest->get()) {
+            out << unsigned(c) << " ";
+        }
+    } else {
+        out << "{}";
+    }
+    out << " }";
     return out.str();
+}
+
+result::result()
+    : result([] {
+        bytes_ostream out;
+        ser::writer_of_query_result(out).skip_partitions().end_query_result();
+        return out;
+    }())
+{ }
+
+foreign_ptr<lw_shared_ptr<query::result>> result_merger::get() {
+    if (_partial.size() == 1) {
+        return std::move(_partial[0]);
+    }
+
+    bytes_ostream w;
+    auto partitions = ser::writer_of_query_result(w).start_partitions();
+
+    for (auto&& r : _partial) {
+        result_view::do_with(*r, [&] (result_view rv) {
+            for (auto&& pv : rv._v.partitions()) {
+                partitions.add(pv);
+            }
+        });
+    }
+
+    std::move(partitions).end_partitions().end_query_result();
+
+    return make_foreign(make_lw_shared<query::result>(std::move(w)));
 }
 
 }

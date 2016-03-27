@@ -21,11 +21,12 @@
 
 #pragma once
 
-#include "types.hh"
-#include "net/byteorder.hh"
+#include <boost/range/iterator_range.hpp>
+
+#include "bytes.hh"
 #include "core/unaligned.hh"
 #include "hashing.hh"
-
+#include "seastar/core/simple-stream.hh"
 /**
  * Utility for writing data into a buffer when its final size is not known up front.
  *
@@ -42,6 +43,14 @@ private:
     struct chunk {
         // FIXME: group fragment pointers to reduce pointer chasing when packetizing
         std::unique_ptr<chunk> next;
+        ~chunk() {
+            auto p = std::move(next);
+            while (p) {
+                // Avoid recursion when freeing chunks
+                auto p_next = std::move(p->next);
+                p = std::move(p_next);
+            }
+        }
         size_type offset; // Also means "size" after chunk is closed
         size_type size;
         value_type data[0];
@@ -163,15 +172,11 @@ public:
     template <typename T>
     struct place_holder {
         value_type* ptr;
+        // makes the place_holder looks like a stream
+        seastar::simple_output_stream get_stream() {
+            return seastar::simple_output_stream{reinterpret_cast<char*>(ptr)};
+        }
     };
-
-    // Writes given values in big-endian format
-    template <typename T>
-    inline
-    std::enable_if_t<std::is_fundamental<T>::value, void>
-    write(T val) {
-        *reinterpret_cast<unaligned<T>*>(alloc(sizeof(T))) = net::hton(val);
-    }
 
     // Returns a place holder for a value to be written later.
     template <typename T>
@@ -206,17 +211,8 @@ public:
         }
     }
 
-    // Writes given sequence of bytes with a preceding length component encoded in big-endian format
-    inline void write_blob(bytes_view v) {
-        assert((size_type)v.size() == v.size());
-        write<size_type>(v.size());
-        write(v);
-    }
-
-    // Writes given value into the place holder in big-endian format
-    template <typename T>
-    inline void set(place_holder<T> ph, T val) {
-        *reinterpret_cast<unaligned<T>*>(ph.ptr) = net::hton(val);
+    void write(const char* ptr, size_t size) {
+        write(bytes_view(reinterpret_cast<const signed char*>(ptr), size));
     }
 
     bool is_linearized() const {

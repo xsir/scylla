@@ -31,6 +31,11 @@
 #include "service/migration_manager.hh"
 #include "schema_builder.hh"
 
+#include "disk-error-handler.hh"
+
+thread_local disk_error_signal_type commit_error;
+thread_local disk_error_signal_type general_disk_error;
+
 SEASTAR_TEST_CASE(test_new_schema_with_no_structural_change_is_propagated) {
     return do_with_cql_env([](cql_test_env& e) {
         return seastar::async([&] {
@@ -74,7 +79,7 @@ SEASTAR_TEST_CASE(test_tombstones_are_ignored_in_version_calculation) {
             auto old_node_version = e.db().local().get_version();
 
             {
-                BOOST_MESSAGE("Applying a no-op tombstone to v1 column definition");
+                BOOST_TEST_MESSAGE("Applying a no-op tombstone to v1 column definition");
                 auto s = db::schema_tables::columns();
                 auto pkey = partition_key::from_singular(*s, table_schema->ks_name());
                 mutation m(pkey, s);

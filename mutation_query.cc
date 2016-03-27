@@ -21,8 +21,9 @@
 
 #include "mutation_query.hh"
 #include "gc_clock.hh"
-#include "db/serializer.hh"
 #include "mutation_partition_serializer.hh"
+#include "service/priority_manager.hh"
+#include "query-result-writer.hh"
 
 reconcilable_result::~reconcilable_result() {}
 
@@ -54,7 +55,7 @@ bool reconcilable_result::operator!=(const reconcilable_result& other) const {
 
 query::result
 to_data_query_result(const reconcilable_result& r, schema_ptr s, const query::partition_slice& slice) {
-    auto builder = query::result::builder(slice);
+    query::result::builder builder(slice, query::result_request::only_result);
     for (const partition& p : r.partitions()) {
         auto pb = builder.add_partition(*s, p._m.key(*s));
         p.mut().unfreeze(s).partition().query(pb, *s, gc_clock::time_point::min(), query::max_rows);
@@ -99,7 +100,7 @@ mutation_query(schema_ptr s,
 
     return do_with(query_state(range, slice, row_limit, query_time),
                    [&source, s = std::move(s)] (query_state& state) -> future<reconcilable_result> {
-        state.reader = source(std::move(s), state.range);
+        state.reader = source(std::move(s), state.range, service::get_local_sstable_query_read_priority());
         return consume(state.reader, [&state] (mutation&& m) {
             // FIXME: Make data sources respect row_ranges so that we don't have to filter them out here.
             auto is_distinct = state.slice.options.contains(query::partition_slice::option::distinct);
@@ -109,13 +110,15 @@ mutation_query(schema_ptr s,
                 is_reversed, limit);
             state.limit -= rows_left;
 
-            // NOTE: We must return all columns, regardless of what's in
-            // partition_slice, for the results to be reconcilable with tombstones.
-            // That's because row's presence depends on existence of any
-            // column in a row (See mutation_partition::query). We could
-            // optimize this case and only send cell timestamps, without data,
-            // for the cells which are not queried for (TODO).
-            state.result.emplace_back(partition{rows_left, freeze(m)});
+            if (rows_left || !m.partition().empty()) {
+                // NOTE: We must return all columns, regardless of what's in
+                // partition_slice, for the results to be reconcilable with tombstones.
+                // That's because row's presence depends on existence of any
+                // column in a row (See mutation_partition::query). We could
+                // optimize this case and only send cell timestamps, without data,
+                // for the cells which are not queried for (TODO).
+                state.result.emplace_back(partition{rows_left, freeze(m)});
+            }
 
             return state.limit ? stop_iteration::no : stop_iteration::yes;
         }).then([&state] {

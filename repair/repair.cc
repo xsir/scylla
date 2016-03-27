@@ -26,12 +26,14 @@
 #include "gms/inet_address.hh"
 #include "db/config.hh"
 #include "service/storage_service.hh"
+#include "service/priority_manager.hh"
 
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
 
 #include <cryptopp/sha.h>
+#include <seastar/core/gate.hh>
 
 static logging::logger logger("repair");
 
@@ -202,8 +204,11 @@ private:
     // Successfully-finished repairs are those with id < _next_repair_command
     // but aren't listed as running or failed the status map.
     std::unordered_map<int, repair_status> _status;
+    // Used to allow shutting down repairs in progress, and waiting for them.
+    seastar::gate _gate;
 public:
     void start(int id) {
+        _gate.enter();
         _status[id] = repair_status::RUNNING;
     }
     void done(int id, bool succeeded) {
@@ -212,6 +217,7 @@ public:
         } else {
             _status[id] = repair_status::FAILED;
         }
+        _gate.leave();
     }
     repair_status get(int id) {
         if (id >= _next_repair_command) {
@@ -227,61 +233,78 @@ public:
     int next_repair_command() {
         return _next_repair_command++;
     }
+    future<> shutdown() {
+        return _gate.close();
+    }
+    void check_in_shutdown() {
+        _gate.check();
+    }
 } repair_tracker;
+
+static void check_in_shutdown() {
+    // Only call this from the single CPU managing the repair - the only CPU
+    // which is allowed to use repair_tracker.
+    assert(engine().cpu_id() == 0);
+    repair_tracker.check_in_shutdown();
+}
+
+class sha256_hasher {
+    CryptoPP::SHA256 hash{};
+public:
+    void update(const char* ptr, size_t length) {
+        static_assert(sizeof(char) == sizeof(byte), "Assuming lengths will be the same");
+        hash.Update(reinterpret_cast<const byte*>(ptr), length * sizeof(byte));
+    }
+
+    void finalize(std::array<uint8_t, 32>& digest) {
+        static_assert(CryptoPP::SHA256::DIGESTSIZE == std::tuple_size<std::remove_reference_t<decltype(digest)>>::value * sizeof(digest[0]),
+                "digest size");
+        hash.Final(reinterpret_cast<unsigned char*>(digest.data()));
+    }
+};
 
 
 partition_checksum::partition_checksum(const mutation& m) {
-    auto frozen = freeze(m);
-    auto bytes = frozen.representation();
-    CryptoPP::SHA256 hash;
-    static_assert(CryptoPP::SHA256::DIGESTSIZE == sizeof(_digest),
-            "digest size");
-    static_assert(sizeof(char) == sizeof(decltype(*bytes.data())),
-            "Assumed that chars are bytes");
-    hash.CalculateDigest(reinterpret_cast<unsigned char*>(_digest),
-            reinterpret_cast<const unsigned char*>(bytes.data()),
-            bytes.size());
+    sha256_hasher h;
+    feed_hash(h, m);
+    h.finalize(_digest);
+}
+
+static inline unaligned<uint64_t>& qword(std::array<uint8_t, 32>& b, int n) {
+    return *unaligned_cast<uint64_t>(b.data() + 8 * n);
+}
+static inline const unaligned<uint64_t>& qword(const std::array<uint8_t, 32>& b, int n) {
+    return *unaligned_cast<uint64_t>(b.data() + 8 * n);
 }
 
 void partition_checksum::add(const partition_checksum& other) {
-     static_assert(sizeof(_digest) / sizeof(_digest[0]) == 4, "digest size");
-     _digest[0] ^= other._digest[0];
-     _digest[1] ^= other._digest[1];
-     _digest[2] ^= other._digest[2];
-     _digest[3] ^= other._digest[3];
+     static_assert(std::tuple_size<decltype(_digest)>::value == 32, "digest size");
+     // Hopefully the following trickery is faster than XOR'ing 32 separate bytes
+     qword(_digest, 0) = qword(_digest, 0) ^ qword(other._digest, 0);
+     qword(_digest, 1) = qword(_digest, 1) ^ qword(other._digest, 1);
+     qword(_digest, 2) = qword(_digest, 2) ^ qword(other._digest, 2);
+     qword(_digest, 3) = qword(_digest, 3) ^ qword(other._digest, 3);
 }
 
 bool partition_checksum::operator==(const partition_checksum& other) const {
-    static_assert(sizeof(_digest) / sizeof(_digest[0]) == 4, "digest size");
-    return  _digest[0] == other._digest[0] &&
-            _digest[1] == other._digest[1] &&
-            _digest[2] == other._digest[2] &&
-            _digest[3] == other._digest[3];
+    static_assert(std::tuple_size<decltype(_digest)>::value == 32, "digest size");
+    return qword(_digest, 0) == qword(other._digest, 0) &&
+           qword(_digest, 1) == qword(other._digest, 1) &&
+           qword(_digest, 2) == qword(other._digest, 2) &&
+           qword(_digest, 3) == qword(other._digest, 3);
 }
 
-void partition_checksum::serialize(bytes::iterator& out) const {
-    out = std::copy(
-            reinterpret_cast<const char*>(&_digest),
-            reinterpret_cast<const char*>(&_digest) + sizeof(_digest),
-            out);
-}
-
-partition_checksum partition_checksum::deserialize(bytes_view& in) {
-    partition_checksum ret;
-    auto v = read_simple_bytes(in, sizeof(ret._digest));
-    std::copy(v.begin(), v.end(), reinterpret_cast<char*>(ret._digest));
-    return ret;
-}
-
-size_t partition_checksum::serialized_size() const {
-    return sizeof(_digest);
+const std::array<uint8_t, 32>& partition_checksum::digest() const {
+    return _digest;
 }
 
 std::ostream& operator<<(std::ostream& out, const partition_checksum& c) {
-    out << std::hex;
-    std::copy(c._digest, c._digest + sizeof(c._digest)/sizeof(c._digest[0]),
-            std::ostream_iterator<decltype(c._digest[0])>(out, "-"));
-    out << std::dec;
+    auto save_flags = out.flags();
+    out << std::hex << std::setfill('0');
+    for (auto b : c._digest) {
+        out << std::setw(2) << (unsigned int)b;
+    }
+    out.flags(save_flags);
     return out;
 }
 
@@ -304,7 +327,7 @@ static future<partition_checksum> checksum_range_shard(database &db,
         const ::range<dht::token>& range) {
     auto& cf = db.find_column_family(keyspace_name, cf_name);
     return do_with(query::to_partition_range(range), [&cf] (const auto& partition_range) {
-        return do_with(cf.make_reader(cf.schema(), partition_range), partition_checksum(),
+        return do_with(cf.make_reader(cf.schema(), partition_range, service::get_local_streaming_read_priority()), partition_checksum(),
             [] (auto& reader, auto& checksum) {
             return repeat([&reader, &checksum] () {
                 return reader().then([&checksum] (auto mopt) {
@@ -393,6 +416,21 @@ static void split_and_add(std::vector<::range<dht::token>>& ranges,
     ranges.push_back(halves.first);
     ranges.push_back(halves.second);
 }
+// We don't need to wait for one checksum to finish before we start the
+// next, but doing too many of these operations in parallel also doesn't
+// make sense, so we limit the number of concurrent ongoing checksum
+// requests with a semaphore.
+//
+// FIXME: We shouldn't use a magic number here, but rather bind it to
+// some resource. Otherwise we'll be doing too little in some machines,
+// and too much in others.
+//
+// FIXME: This would be better of in a repair service, or even a per-shard
+// repair instance holding all repair state. However, since we are anyway
+// considering ditching those semaphores for a more fine grained resource-based
+// solution, let's do the simplest thing here and change it later
+constexpr int parallelism = 100;
+static thread_local semaphore parallelism_semaphore(parallelism);
 
 // Repair a single cf in a single local range.
 // Comparable to RepairJob in Origin.
@@ -439,16 +477,14 @@ static future<> repair_cf_range(seastar::sharded<database>& db,
         split_and_add(ranges, range, estimated_partitions, 100);
     }
 
-    // We don't need to wait for one checksum to finish before we start the
-    // next, but doing too many of these operations in parallel also doesn't
-    // make sense, so we limit the number of concurrent ongoing checksum
-    // requests with a semaphore.
-    constexpr int parallelism = 100;
-    return do_with(semaphore(parallelism), true, std::move(keyspace), std::move(cf), std::move(ranges),
-        [&db, &neighbors, parallelism] (auto& sem, auto& success, const auto& keyspace, const auto& cf, const auto& ranges) {
-        return do_for_each(ranges, [&sem, &success, &db, &neighbors, &keyspace, &cf]
+    return do_with(seastar::gate(), true, std::move(keyspace), std::move(cf), std::move(ranges),
+        [&db, &neighbors] (auto& completion, auto& success, const auto& keyspace, const auto& cf, const auto& ranges) {
+        return do_for_each(ranges, [&completion, &success, &db, &neighbors, &keyspace, &cf]
                            (const auto& range) {
-            return sem.wait(1).then([&sem, &success, &db, &neighbors, &keyspace, &cf, &range] {
+
+            check_in_shutdown();
+            return parallelism_semaphore.wait(1).then([&completion, &success, &db, &neighbors, &keyspace, &cf, &range] {
+
                 // Ask this node, and all neighbors, to calculate checksums in
                 // this range. When all are done, compare the results, and if
                 // there are any differences, sync the content of this range.
@@ -460,6 +496,8 @@ static future<> repair_cf_range(seastar::sharded<database>& db,
                             net::get_local_messaging_service().send_repair_checksum_range(
                                     net::msg_addr{neighbor},keyspace, cf, range));
                 }
+
+                completion.enter();
                 when_all(checksums.begin(), checksums.end()).then(
                         [&db, &keyspace, &cf, &range, &neighbors, &success]
                         (std::vector<future<partition_checksum>> checksums) {
@@ -505,10 +543,13 @@ static future<> repair_cf_range(seastar::sharded<database>& db,
                     // tell the caller.
                     success = false;
                     logger.warn("Failed sync of range {}: {}", range, eptr);
-                }).finally([&sem] { sem.signal(1); });
+                }).finally([&completion] {
+                    parallelism_semaphore.signal(1);
+                    completion.leave(); // notify do_for_each that we're done
+                });
             });
-        }).finally([&sem, &success, parallelism] {
-            return sem.wait(parallelism).then([&success] {
+        }).finally([&success, &completion] {
+            return completion.close().then([&success] {
                 return success ? make_ready_future<>() :
                         make_exception_future<>(std::runtime_error("Checksum or sync of partial range failed"));
             });
@@ -566,6 +607,11 @@ struct repair_options {
     // for determining the list of ranges to repair. In particular, "ranges"
     // overrides the setting of "primary_range".
     std::vector<query::range<dht::token>> ranges;
+    // If start_token and end_token are set, they define a range which is
+    // intersected with the ranges actually held by this node to decide what
+    // to repair.
+    sstring start_token;
+    sstring end_token;
     // column_families is the list of column families to repair in the given
     // keyspace. If this list is empty (the default), all the column families
     // in this keyspace are repaired
@@ -603,6 +649,8 @@ struct repair_options {
             throw std::runtime_error(sprint(
                     "unsupported repair parallelism: %d", parallelism));
         }
+        string_opt(start_token, options, START_TOKEN);
+        string_opt(end_token, options, END_TOKEN);
         // The parsing code above removed from the map options we have parsed.
         // If anything is left there in the end, it's an unsupported option.
         if (!options.empty()) {
@@ -612,14 +660,16 @@ struct repair_options {
     }
 
     static constexpr const char* PRIMARY_RANGE_KEY = "primaryRange";
-    static constexpr const char* PARALLELISM_KEY = "parallelism"; // TODO
-    static constexpr const char* INCREMENTAL_KEY = "incremental"; // TODO
-    static constexpr const char* JOB_THREADS_KEY = "jobThreads"; // TODO
+    static constexpr const char* PARALLELISM_KEY = "parallelism";
+    static constexpr const char* INCREMENTAL_KEY = "incremental";
+    static constexpr const char* JOB_THREADS_KEY = "jobThreads";
     static constexpr const char* RANGES_KEY = "ranges";
-    static constexpr const char* COLUMNFAMILIES_KEY = "columnFamilies"; // TODO
-    static constexpr const char* DATACENTERS_KEY = "dataCenters"; // TODO
-    static constexpr const char* HOSTS_KEY = "hosts"; // TODO
-    static constexpr const char* TRACE_KEY = "trace"; // TODO
+    static constexpr const char* COLUMNFAMILIES_KEY = "columnFamilies";
+    static constexpr const char* DATACENTERS_KEY = "dataCenters";
+    static constexpr const char* HOSTS_KEY = "hosts";
+    static constexpr const char* TRACE_KEY = "trace";
+    static constexpr const char* START_TOKEN = "startToken";
+    static constexpr const char* END_TOKEN = "endToken";
 
     // Settings of "parallelism" option. Numbers must match Cassandra's
     // RepairParallelism enum, which is used by the caller.
@@ -653,6 +703,16 @@ private:
             if (errno) {
                 throw(std::runtime_error(sprint("cannot parse integer: '%s'", it->second)));
             }
+            options.erase(it);
+        }
+    }
+
+    static void string_opt(sstring& var,
+            std::unordered_map<sstring, sstring>& options,
+            const sstring& key) {
+        auto it = options.find(key);
+        if (it != options.end()) {
+            var = it->second;
             options.erase(it);
         }
     }
@@ -716,6 +776,7 @@ static future<> repair_ranges(seastar::sharded<database>& db, sstring keyspace,
         // repair all the ranges in sequence
         return do_for_each(ranges.begin(), ranges.end(), [&db, keyspace, &cfs, &data_centers, &hosts, id] (auto&& range) {
 #endif
+            check_in_shutdown();
             return repair_range(db, keyspace, range, cfs, data_centers, hosts);
         }).then([id] {
             logger.info("repair {} completed sucessfully", id);
@@ -734,6 +795,7 @@ static future<> repair_ranges(seastar::sharded<database>& db, sstring keyspace,
 // itself does very little (mainly tell other nodes and CPUs what to do).
 static int do_repair_start(seastar::sharded<database>& db, sstring keyspace,
         std::unordered_map<sstring, sstring> options_map) {
+    check_in_shutdown();
 
     repair_options options(options_map);
 
@@ -776,6 +838,33 @@ static int do_repair_start(seastar::sharded<database>& db, sstring keyspace,
         ranges = get_local_ranges(db.local(), keyspace);
     }
 
+    if (!options.start_token.empty() || !options.end_token.empty()) {
+        // Intersect the list of local ranges with the given token range,
+        // dropping ranges with no intersection.
+        // We don't have a range::intersect() method, but we can use
+        // range::subtract() and subtract the complement range.
+        std::experimental::optional<::range<dht::token>::bound> tok_start;
+        std::experimental::optional<::range<dht::token>::bound> tok_end;
+        if (!options.start_token.empty()) {
+            tok_start = ::range<dht::token>::bound(
+                dht::global_partitioner().from_sstring(options.start_token),
+                true);
+        }
+        if (!options.end_token.empty()) {
+            tok_end = ::range<dht::token>::bound(
+                dht::global_partitioner().from_sstring(options.end_token),
+                false);
+        }
+        ::range<dht::token> given_range_complement(tok_end, tok_start);
+        std::vector<query::range<dht::token>> intersections;
+        for (const auto& range : ranges) {
+            auto rs = range.subtract(given_range_complement,
+                    dht::token_comparator());
+            intersections.insert(intersections.end(), rs.begin(), rs.end());
+        }
+        ranges = std::move(intersections);
+    }
+
     std::vector<sstring> cfs;
     if (options.column_families.size()) {
         cfs = options.column_families;
@@ -807,5 +896,14 @@ future<int> repair_start(seastar::sharded<database>& db, sstring keyspace,
 future<repair_status> repair_get_status(seastar::sharded<database>& db, int id) {
     return db.invoke_on(0, [id] (database& localdb) {
         return repair_tracker.get(id);
+    });
+}
+
+future<> repair_shutdown(seastar::sharded<database>& db) {
+    logger.info("Starting shutdown of repair");
+    return db.invoke_on(0, [] (database& localdb) {
+        return repair_tracker.shutdown().then([] {
+            logger.info("Completed shutdown of repair");
+        });
     });
 }

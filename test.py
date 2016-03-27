@@ -25,6 +25,7 @@ import argparse
 import subprocess
 import signal
 import shlex
+import threading
 
 boost_tests = [
     'bytes_ostream_test',
@@ -39,7 +40,6 @@ boost_tests = [
     'sstable_mutation_test',
     'commitlog_test',
     'hash_test',
-    'serializer_test',
     'test-serialization',
     'cartesian_product_test',
     'allocation_strategy_test',
@@ -67,6 +67,7 @@ boost_tests = [
     'mutation_query_test',
     'snitch_reset_test',
     'auth_test',
+    'idl_test',
 ]
 
 other_tests = [
@@ -144,43 +145,38 @@ if __name__ == "__main__":
         path = test[0]
         prefix = '[%d/%d]' % (n + 1, n_total)
         path += ' --collectd 0'
-        print_status('%s RUNNING %s' % (prefix, path))
         signal.signal(signal.SIGALRM, alarm_handler)
         if args.jenkins and test[1] == 'boost':
             mode = 'release'
             if test[0].startswith(os.path.join('build', 'debug')):
                 mode = 'debug'
             xmlout = (args.jenkins + "." + mode + "." +
-                      os.path.basename(test[0]) + ".boost.xml")
+                      os.path.basename(test[0].split()[0]) + ".boost.xml")
             path = path + " --output_format=XML --log_level=test_suite --report_level=no --log_sink=" + xmlout
-            print(path)
+        print_status('%s RUNNING %s' % (prefix, path))
         proc = subprocess.Popen(shlex.split(path), stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT,
                                 env=env, preexec_fn=os.setsid)
-        signal.alarm(args.timeout)
-        err = None
         out = None
-        try:
-            out, err = proc.communicate()
-            signal.alarm(0)
-        except:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            proc.kill()
-            proc.returncode = -1
-        finally:
-            if proc.returncode:
-                print_status('FAILED: %s\n' % (path))
-                if proc.returncode == -1:
-                    print_status('TIMED OUT\n')
-                else:
-                    print_status('  with error code {code}\n'.format(code=proc.returncode))
-                if out:
-                    print('=== stdout START ===')
-                    print(str(out, encoding='UTF-8'))
-                    print('=== stdout END ===')
-                all_ok = False
-            else:
-                print_status('%s PASSED %s' % (prefix, path))
+        def on_timeout():
+            if proc.returncode is None:
+                print_status('TIMED OUT\n')
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                proc.kill()
+        timeout = threading.Timer(args.timeout, on_timeout)
+        timeout.start()
+        out, _ = proc.communicate()
+        timeout.cancel()
+        if proc.returncode:
+            print_status('FAILED: %s\n' % (path))
+            print_status('  with error code {code}\n'.format(code=proc.returncode))
+            if out:
+                print('=== stdout START ===')
+                print(str(out, encoding='UTF-8'))
+                print('=== stdout END ===')
+            all_ok = False
+        else:
+            print_status('%s PASSED %s' % (prefix, path))
 
     if all_ok:
         print('\nOK.')

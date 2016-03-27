@@ -78,7 +78,7 @@ void update_statement::add_update_for_key(mutation& m, const exploded_clustering
         // If there are static columns, there also must be clustering columns, in which
         // case empty prefix can only refer to the static row.
         bool is_static_prefix = s->has_static_columns() && !prefix;
-        if (type == statement_type::INSERT && !is_static_prefix) {
+        if (type == statement_type::INSERT && !is_static_prefix && s->is_cql3_table()) {
             auto& row = m.partition().clustered_row(clustering_key::from_clustering_prefix(*s, prefix));
             row.apply(row_marker(params.timestamp(), params.ttl(), params.expiry()));
         }
@@ -137,19 +137,17 @@ update_statement::parsed_insert::prepare_internal(database& db, schema_ptr schem
         throw exceptions::invalid_request_exception("No columns provided to INSERT");
     }
 
+    std::unordered_set<bytes> column_ids;
     for (size_t i = 0; i < _column_names.size(); i++) {
         auto id = _column_names[i]->prepare_column_identifier(schema);
         auto def = get_column_definition(schema, *id);
         if (!def) {
             throw exceptions::invalid_request_exception(sprint("Unknown identifier %s", *id));
         }
-
-        for (size_t j = 0; j < i; j++) {
-            auto other_id = _column_names[j]->prepare_column_identifier(schema);
-            if (*id == *other_id) {
-                throw exceptions::invalid_request_exception(sprint("Multiple definitions found for column %s", *id));
-            }
+        if (column_ids.count(id->name())) {
+            throw exceptions::invalid_request_exception(sprint("Multiple definitions found for column %s", *id));
         }
+        column_ids.emplace(id->name());
 
         auto&& value = _column_values[i];
 

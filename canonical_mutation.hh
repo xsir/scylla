@@ -24,7 +24,6 @@
 #include "bytes.hh"
 #include "schema.hh"
 #include "database_fwd.hh"
-#include "db/serializer.hh"
 #include "mutation_partition_visitor.hh"
 #include "mutation_partition_serializer.hh"
 
@@ -33,8 +32,8 @@
 // Safe to pass serialized across nodes.
 class canonical_mutation {
     bytes _data;
-    canonical_mutation(bytes);
 public:
+    explicit canonical_mutation(bytes);
     explicit canonical_mutation(const mutation&);
 
     canonical_mutation(canonical_mutation&&) = default;
@@ -51,23 +50,6 @@ public:
 
     utils::UUID column_family_id() const;
 
-    friend class db::serializer<canonical_mutation>;
+    const bytes& representation() const { return _data; }
+
 };
-//
-//template<>
-//struct hash<canonical_mutation> {
-//    template<typename Hasher>
-//    void operator()(Hasher& h, const canonical_mutation& m) const {
-//        m.feed_hash(h);
-//    }
-//};
-
-namespace db {
-
-template<> serializer<canonical_mutation>::serializer(const canonical_mutation&);
-template<> void serializer<canonical_mutation>::write(output&, const canonical_mutation&);
-template<> canonical_mutation serializer<canonical_mutation>::read(input&);
-
-extern template class serializer<canonical_mutation>;
-
-}

@@ -24,10 +24,11 @@
 #include "gms/failure_detector.hh"
 #include "gms/gossiper.hh"
 #include "service/storage_service.hh"
-#include "streaming/messages/prepare_message.hh"
+#include "streaming/prepare_message.hh"
 #include "gms/gossip_digest_syn.hh"
 #include "gms/gossip_digest_ack.hh"
 #include "gms/gossip_digest_ack2.hh"
+#include "gms/gossiper.hh"
 #include "query-request.hh"
 #include "query-result.hh"
 #include "rpc/rpc.hh"
@@ -35,17 +36,55 @@
 #include "dht/i_partitioner.hh"
 #include "range.hh"
 #include "frozen_schema.hh"
+#include "repair/repair.hh"
+#include "idl/result.dist.hh"
+#include "idl/reconcilable_result.dist.hh"
+#include "idl/ring_position.dist.hh"
+#include "idl/keys.dist.hh"
+#include "idl/uuid.dist.hh"
+#include "idl/frozen_mutation.dist.hh"
+#include "idl/frozen_schema.dist.hh"
+#include "idl/streaming.dist.hh"
+#include "idl/token.dist.hh"
+#include "idl/gossip_digest.dist.hh"
+#include "idl/read_command.dist.hh"
+#include "idl/range.dist.hh"
+#include "idl/partition_checksum.dist.hh"
 #include "serializer_impl.hh"
+#include "serialization_visitors.hh"
+#include "idl/result.dist.impl.hh"
+#include "idl/reconcilable_result.dist.impl.hh"
+#include "idl/ring_position.dist.impl.hh"
+#include "idl/keys.dist.impl.hh"
+#include "idl/uuid.dist.impl.hh"
+#include "idl/frozen_mutation.dist.impl.hh"
+#include "idl/frozen_schema.dist.impl.hh"
+#include "idl/streaming.dist.impl.hh"
+#include "idl/token.dist.impl.hh"
+#include "idl/gossip_digest.dist.impl.hh"
+#include "idl/read_command.dist.impl.hh"
+#include "idl/range.dist.impl.hh"
+#include "idl/partition_checksum.dist.impl.hh"
 
 namespace net {
+
+// thunk from rpc serializers to generate serializers
+template <typename T, typename Output>
+void write(serializer, Output& out, const T& data) {
+    ser::serialize(out, data);
+}
+template <typename T, typename Input>
+T read(serializer, Input& in, boost::type<T> type) {
+    return ser::deserialize(in, type);
+}
 
 template <typename Output, typename T>
 void write(serializer s, Output& out, const foreign_ptr<T>& v) {
     return write(s, out, *v);
 }
 template <typename Input, typename T>
-foreign_ptr<T> read(serializer s, Input& in, rpc::type<foreign_ptr<T>>) {
-    return make_foreign(read(s, in, rpc::type<T>()));
+foreign_ptr<T> read(serializer s, Input& in, boost::type<foreign_ptr<T>>) {
+    return make_foreign(read(s, in, boost::type<T>()));
 }
 
 template <typename Output, typename T>
@@ -53,193 +92,8 @@ void write(serializer s, Output& out, const lw_shared_ptr<T>& v) {
     return write(s, out, *v);
 }
 template <typename Input, typename T>
-lw_shared_ptr<T> read(serializer s, Input& in, rpc::type<lw_shared_ptr<T>>) {
-    return make_lw_shared(read(s, in, rpc::type<T>()));
-}
-
-// For vectors
-template <typename T, typename Output>
-void write(serializer, Output& out, const std::vector<T>& data) {
-    ser::serialize(out, data);
-}
-template <typename T, typename Input>
-std::vector<T> read(serializer, Input& in, rpc::type<std::vector<T>> type) {
-    return ser::deserialize(in, type);
-}
-
-// Gossip syn
-template<typename Output>
-void write(serializer, Output& out, const gms::gossip_digest_syn& data) {
-    ser::serialize(out, data);
-}
-
-template <typename Input>
-gms::gossip_digest_syn
-read(serializer, Input& in, rpc::type<gms::gossip_digest_syn> type) {
-    return ser::deserialize(in, type);
-}
-
-// Gossip ack
-template<typename Output>
-void write(serializer, Output& out, const gms::gossip_digest_ack& data) {
-    ser::serialize(out, data);
-}
-
-template <typename Input>
-gms::gossip_digest_ack
-read(serializer, Input& in, rpc::type<gms::gossip_digest_ack> type) {
-    return ser::deserialize(in, type);
-}
-
-// Gossip ack2
-template<typename Output>
-void write(serializer, Output& out, const gms::gossip_digest_ack2& data) {
-    ser::serialize(out, data);
-}
-
-template <typename Input>
-gms::gossip_digest_ack2
-read(serializer, Input& in, rpc::type<gms::gossip_digest_ack2> type) {
-    return ser::deserialize(in, type);
-}
-
-// Gossip digest
-template<typename Output>
-void write(serializer, Output& out, const gms::gossip_digest& data) {
-    ser::serialize(out, data);
-}
-
-template <typename Input>
-gms::gossip_digest
-read(serializer, Input& in, rpc::type<gms::gossip_digest> type) {
-    return ser::deserialize(in, type);
-}
-
-// Gossip versioned_value
-template<typename Output>
-void write(serializer, Output& out, const gms::versioned_value& data) {
-    ser::serialize(out, data);
-}
-
-template <typename Input>
-gms::versioned_value
-read(serializer, Input& in, rpc::type<gms::versioned_value> type) {
-    return ser::deserialize(in, type);
-}
-
-// Gossip endpoint_state
-template<typename Output>
-void write(serializer, Output& out, const gms::endpoint_state& data) {
-    ser::serialize(out, data);
-}
-
-template <typename Input>
-gms::endpoint_state
-read(serializer, Input& in, rpc::type<gms::endpoint_state> type) {
-    return ser::deserialize(in, type);
-}
-
-// Gossip heart_beat_state
-template<typename Output>
-void write(serializer, Output& out, const gms::heart_beat_state& data) {
-    ser::serialize(out, data);
-}
-
-template <typename Input>
-gms::heart_beat_state
-read(serializer, Input& in, rpc::type<gms::heart_beat_state> type) {
-    return ser::deserialize(in, type);
-}
-
-template<typename Output>
-void write(serializer, Output& out, const query::read_command& data) {
-    ser::serialize(out, data);
-}
-
-template <typename Input>
-query::read_command
-read(serializer, Input& in, rpc::type<query::read_command> type) {
-    return ser::deserialize(in, type);
-}
-
-template<typename Output>
-void write(serializer, Output& out, const query::partition_range& data) {
-    ser::serialize(out, data);
-}
-
-template <typename Input>
-query::partition_range
-read(serializer, Input& in, rpc::type<query::partition_range> type) {
-    return ser::deserialize(in, type);
-}
-
-template<typename Output>
-void write(serializer, Output& out, const query::result& data) {
-    ser::serialize(out, data);
-}
-
-template <typename Input>
-query::result
-read(serializer, Input& in, rpc::type<query::result> type) {
-    return ser::deserialize(in, type);
-}
-
-template<typename Output>
-void write(serializer, Output& out, const frozen_mutation& data) {
-    ser::serialize(out, data);
-}
-
-template <typename Input>
-frozen_mutation
-read(serializer, Input& in, rpc::type<frozen_mutation> type) {
-    return ser::deserialize(in, type);
-}
-
-template<typename Output>
-void write(serializer, Output& out, const reconcilable_result& data) {
-    ser::serialize(out, data);
-}
-
-template <typename Input>
-reconcilable_result
-read(serializer, Input& in, rpc::type<reconcilable_result> type) {
-    return ser::deserialize(in, type);
-}
-
-// streaming reqeust
-template<typename Output>
-void write(serializer, Output& out, const streaming::stream_request& data) {
-    ser::serialize(out, data);
-}
-
-template <typename Input>
-streaming::stream_request
-read(serializer, Input& in, rpc::type<streaming::stream_request> type) {
-    return ser::deserialize(in, type);
-}
-
-// streaming summary
-template<typename Output>
-void write(serializer, Output& out, const streaming::stream_summary& data) {
-    ser::serialize(out, data);
-}
-
-template <typename Input>
-streaming::stream_summary
-read(serializer, Input& in, rpc::type<streaming::stream_request> type) {
-    return ser::deserialize(in, type);
-}
-
-// streaming prepare_message
-template<typename Output>
-void write(serializer, Output& out, const streaming::messages::prepare_message& data) {
-    ser::serialize(out, data);
-}
-
-template <typename Input>
-streaming::messages::prepare_message
-read(serializer, Input& in, rpc::type<streaming::messages::prepare_message> type) {
-    return ser::deserialize(in, type);
+lw_shared_ptr<T> read(serializer s, Input& in, boost::type<lw_shared_ptr<T>>) {
+    return make_lw_shared(read(s, in, boost::type<T>()));
 }
 
 static logging::logger logger("messaging_service");
@@ -251,15 +105,6 @@ using gossip_digest_ack = gms::gossip_digest_ack;
 using gossip_digest_ack2 = gms::gossip_digest_ack2;
 using rpc_protocol = rpc::protocol<serializer, messaging_verb>;
 using namespace std::chrono_literals;
-template <typename Output>
-void net::serializer::write(Output& out, const query::result& v) const {
-    write_serializable(out, v);
-}
-template <typename Input>
-query::result net::serializer::read(Input& in, rpc::type<query::result>) const {
-    return read_serializable<query::result>(in);
-}
-
 
 struct messaging_service::rpc_protocol_wrapper : public rpc_protocol { using rpc_protocol::rpc_protocol; };
 
@@ -269,11 +114,11 @@ struct messaging_service::rpc_protocol_wrapper : public rpc_protocol { using rpc
 class messaging_service::rpc_protocol_client_wrapper {
     std::unique_ptr<rpc_protocol::client> _p;
 public:
-    rpc_protocol_client_wrapper(rpc_protocol& proto, ipv4_addr addr, ipv4_addr local = ipv4_addr())
-            : _p(std::make_unique<rpc_protocol::client>(proto, addr, local)) {
+    rpc_protocol_client_wrapper(rpc_protocol& proto, rpc::client_options opts, ipv4_addr addr, ipv4_addr local = ipv4_addr())
+            : _p(std::make_unique<rpc_protocol::client>(proto, std::move(opts), addr, local)) {
     }
-    rpc_protocol_client_wrapper(rpc_protocol& proto, ipv4_addr addr, ipv4_addr local, ::shared_ptr<seastar::tls::server_credentials> c)
-            : _p(std::make_unique<rpc_protocol::client>(proto, addr, seastar::tls::connect(c, addr, local)))
+    rpc_protocol_client_wrapper(rpc_protocol& proto, rpc::client_options opts, ipv4_addr addr, ipv4_addr local, ::shared_ptr<seastar::tls::server_credentials> c)
+            : _p(std::make_unique<rpc_protocol::client>(proto, std::move(opts), addr, seastar::tls::connect(c, addr, local)))
     {}
     auto get_stats() const { return _p->get_stats(); }
     future<> stop() { return _p->stop(); }
@@ -430,6 +275,7 @@ gms::inet_address messaging_service::listen_address() {
 }
 
 future<> messaging_service::stop() {
+    _stopping = true;
     return when_all(
         _server->stop(),
         parallel_for_each(_clients, [] (auto& m) {
@@ -456,6 +302,12 @@ static unsigned get_rpc_client_idx(messaging_verb verb) {
         verb == messaging_verb::GOSSIP_ECHO ||
         verb == messaging_verb::GET_SCHEMA_VERSION) {
         idx = 1;
+    } else if (verb == messaging_verb::PREPARE_MESSAGE ||
+               verb == messaging_verb::PREPARE_DONE_MESSAGE ||
+               verb == messaging_verb::STREAM_MUTATION ||
+               verb == messaging_verb::STREAM_MUTATION_DONE ||
+               verb == messaging_verb::COMPLETE_MESSAGE) {
+        idx = 2;
     }
     return idx;
 }
@@ -508,6 +360,7 @@ void messaging_service::cache_preferred_ip(gms::inet_address ep, gms::inet_addre
 }
 
 shared_ptr<messaging_service::rpc_protocol_client_wrapper> messaging_service::get_rpc_client(messaging_verb verb, msg_addr id) {
+    assert(!_stopping);
     auto idx = get_rpc_client_idx(verb);
     auto it = _clients[idx].find(id);
 
@@ -540,10 +393,14 @@ shared_ptr<messaging_service::rpc_protocol_client_wrapper> messaging_service::ge
     auto remote_addr = ipv4_addr(get_preferred_ip(id.addr).raw_addr(), must_encrypt ? _ssl_port : _port);
     auto local_addr = ipv4_addr{_listen_address.raw_addr(), 0};
 
+    rpc::client_options opts;
+    // send keepalive messages each minute if connection is idle, drop connection after 10 failures
+    opts.keepalive = std::experimental::optional<net::tcp_keepalive_params>({60s, 60s, 10});
+
     auto client = must_encrypt ?
-                    ::make_shared<rpc_protocol_client_wrapper>(*_rpc,
+                    ::make_shared<rpc_protocol_client_wrapper>(*_rpc, std::move(opts),
                                     remote_addr, local_addr, _credentials) :
-                    ::make_shared<rpc_protocol_client_wrapper>(*_rpc,
+                    ::make_shared<rpc_protocol_client_wrapper>(*_rpc, std::move(opts),
                                     remote_addr, local_addr);
 
     it = _clients[idx].emplace(id, shard_info(std::move(client))).first;
@@ -553,6 +410,13 @@ shared_ptr<messaging_service::rpc_protocol_client_wrapper> messaging_service::ge
 }
 
 void messaging_service::remove_rpc_client_one(clients_map& clients, msg_addr id, bool dead_only) {
+    if (_stopping) {
+        // if messaging service is in a processed of been stopped no need to
+        // stop and remove connection here since they are being stopped already
+        // and we'll just interfere
+        return;
+    }
+
     auto it = clients.find(id);
     if (it != clients.end() && (!dead_only || it->second.rpc_client->error())) {
         auto client = std::move(it->second.rpc_client);
@@ -586,8 +450,12 @@ std::unique_ptr<messaging_service::rpc_protocol_wrapper>& messaging_service::rpc
 // Send a message for verb
 template <typename MsgIn, typename... MsgOut>
 auto send_message(messaging_service* ms, messaging_verb verb, msg_addr id, MsgOut&&... msg) {
-    auto rpc_client_ptr = ms->get_rpc_client(verb, id);
     auto rpc_handler = ms->rpc()->make_client<MsgIn(MsgOut...)>(verb);
+    if (ms->is_stopping()) {
+        using futurator = futurize<std::result_of_t<decltype(rpc_handler)(rpc_protocol::client&, MsgOut...)>>;
+        return futurator::make_exception_future(rpc::closed_error());
+    }
+    auto rpc_client_ptr = ms->get_rpc_client(verb, id);
     auto& rpc_client = *rpc_client_ptr;
     return rpc_handler(rpc_client, std::forward<MsgOut>(msg)...).then_wrapped([ms = ms->shared_from_this(), id, verb, rpc_client_ptr = std::move(rpc_client_ptr)] (auto&& f) {
         try {
@@ -611,8 +479,12 @@ auto send_message(messaging_service* ms, messaging_verb verb, msg_addr id, MsgOu
 // TODO: Remove duplicated code in send_message
 template <typename MsgIn, typename Timeout, typename... MsgOut>
 auto send_message_timeout(messaging_service* ms, messaging_verb verb, msg_addr id, Timeout timeout, MsgOut&&... msg) {
-    auto rpc_client_ptr = ms->get_rpc_client(verb, id);
     auto rpc_handler = ms->rpc()->make_client<MsgIn(MsgOut...)>(verb);
+    if (ms->is_stopping()) {
+        using futurator = futurize<std::result_of_t<decltype(rpc_handler)(rpc_protocol::client&, MsgOut...)>>;
+        return futurator::make_exception_future(rpc::closed_error());
+    }
+    auto rpc_client_ptr = ms->get_rpc_client(verb, id);
     auto& rpc_client = *rpc_client_ptr;
     return rpc_handler(rpc_client, timeout, std::forward<MsgOut>(msg)...).then_wrapped([ms = ms->shared_from_this(), id, verb, rpc_client_ptr = std::move(rpc_client_ptr)] (auto&& f) {
         try {
@@ -641,19 +513,34 @@ auto send_message_timeout_and_retry(messaging_service* ms, messaging_verb verb, 
     return do_with(int(nr_retry), std::move(msg)..., [ms, verb, id, timeout, wait, nr_retry] (auto& retry, const auto&... messages) {
         return repeat_until_value([ms, verb, id, timeout, wait, nr_retry, &retry, &messages...] {
             return send_message_timeout<MsgIn>(ms, verb, id, timeout, messages...).then_wrapped(
-                    [verb, id, timeout, wait, nr_retry, &retry] (auto&& f) mutable {
+                    [ms, verb, id, timeout, wait, nr_retry, &retry] (auto&& f) mutable {
+                auto vb = int(verb);
                 try {
                     MsgInTuple ret = f.get();
                     if (retry != nr_retry) {
-                        logger.info("Retry verb={} to {}, retry={}: OK", int(verb), id, retry);
+                        logger.info("Retry verb={} to {}, retry={}: OK", vb, id, retry);
                     }
                     return make_ready_future<stdx::optional<MsgInTuple>>(std::move(ret));
                 } catch (rpc::timeout_error) {
-                    logger.info("Retry verb={} to {}, retry={}: timeout in {} seconds", int(verb), id, retry, timeout.count());
+                    logger.info("Retry verb={} to {}, retry={}: timeout in {} seconds", vb, id, retry, timeout.count());
                     throw;
                 } catch (rpc::closed_error) {
-                    logger.info("Retry verb={} to {}, retry={}: {}", int(verb), id, retry, std::current_exception());
-                    if (--retry == 0) {
+                    logger.info("Retry verb={} to {}, retry={}: {}", vb, id, retry, std::current_exception());
+                    // Stop retrying if retry reaches 0 or message service is shutdown
+                    // or the remote node is removed from gossip (on_remove())
+                    retry--;
+                    if (retry == 0) {
+                        logger.debug("Retry verb={} to {}, retry={}: stop retrying: retry == 0", vb, id, retry);
+                        throw;
+                    }
+                    if (ms->is_stopping()) {
+                        logger.debug("Retry verb={} to {}, retry={}: stop retrying: messaging_service is stopped",
+                                     vb, id, retry);
+                        throw;
+                    }
+                    if (!gms::get_local_gossiper().is_known_endpoint(id.addr)) {
+                        logger.debug("Retry verb={} to {}, retry={}: stop retrying: node is removed from the cluster",
+                                     vb, id, retry);
                         throw;
                     }
                     return sleep(wait).then([] {
@@ -663,7 +550,7 @@ auto send_message_timeout_and_retry(messaging_service* ms, messaging_verb verb, 
                     throw;
                 }
             });
-        }).then([] (MsgInTuple result) {
+        }).then([ms = ms->shared_from_this()] (MsgInTuple result) {
             return futurize<MsgIn>::from_tuple(std::move(result));
         });
     });
@@ -691,13 +578,13 @@ static constexpr std::chrono::seconds streaming_timeout{10*60};
 static constexpr std::chrono::seconds streaming_wait_before_retry{30};
 
 // PREPARE_MESSAGE
-void messaging_service::register_prepare_message(std::function<future<streaming::messages::prepare_message> (const rpc::client_info& cinfo,
-        streaming::messages::prepare_message msg, UUID plan_id, sstring description)>&& func) {
+void messaging_service::register_prepare_message(std::function<future<streaming::prepare_message> (const rpc::client_info& cinfo,
+        streaming::prepare_message msg, UUID plan_id, sstring description)>&& func) {
     register_handler(this, messaging_verb::PREPARE_MESSAGE, std::move(func));
 }
-future<streaming::messages::prepare_message> messaging_service::send_prepare_message(msg_addr id, streaming::messages::prepare_message msg, UUID plan_id,
+future<streaming::prepare_message> messaging_service::send_prepare_message(msg_addr id, streaming::prepare_message msg, UUID plan_id,
         sstring description) {
-    return send_message_timeout_and_retry<streaming::messages::prepare_message>(this, messaging_verb::PREPARE_MESSAGE, id,
+    return send_message_timeout_and_retry<streaming::prepare_message>(this, messaging_verb::PREPARE_MESSAGE, id,
         streaming_timeout, streaming_nr_retry, streaming_wait_before_retry,
         std::move(msg), plan_id, std::move(description));
 }
@@ -763,16 +650,29 @@ future<> messaging_service::send_gossip_shutdown(msg_addr id, inet_address from)
     return send_message_oneway(this, messaging_verb::GOSSIP_SHUTDOWN, std::move(id), std::move(from));
 }
 
-void messaging_service::register_gossip_digest_syn(std::function<future<gossip_digest_ack> (gossip_digest_syn)>&& func) {
+// gossip syn
+void messaging_service::register_gossip_digest_syn(std::function<rpc::no_wait_type (const rpc::client_info& cinfo, gossip_digest_syn)>&& func) {
     register_handler(this, messaging_verb::GOSSIP_DIGEST_SYN, std::move(func));
 }
 void messaging_service::unregister_gossip_digest_syn() {
     _rpc->unregister_handler(net::messaging_verb::GOSSIP_DIGEST_SYN);
 }
-future<gossip_digest_ack> messaging_service::send_gossip_digest_syn(msg_addr id, gossip_digest_syn msg) {
-    return send_message_timeout<gossip_digest_ack>(this, messaging_verb::GOSSIP_DIGEST_SYN, std::move(id), 3000ms, std::move(msg));
+future<> messaging_service::send_gossip_digest_syn(msg_addr id, gossip_digest_syn msg) {
+    return send_message_oneway(this, messaging_verb::GOSSIP_DIGEST_SYN, std::move(id), std::move(msg));
 }
 
+// gossip ack
+void messaging_service::register_gossip_digest_ack(std::function<rpc::no_wait_type (const rpc::client_info& cinfo, gossip_digest_ack)>&& func) {
+    register_handler(this, messaging_verb::GOSSIP_DIGEST_ACK, std::move(func));
+}
+void messaging_service::unregister_gossip_digest_ack() {
+    _rpc->unregister_handler(net::messaging_verb::GOSSIP_DIGEST_ACK);
+}
+future<> messaging_service::send_gossip_digest_ack(msg_addr id, gossip_digest_ack msg) {
+    return send_message_oneway(this, messaging_verb::GOSSIP_DIGEST_ACK, std::move(id), std::move(msg));
+}
+
+// gossip ack2
 void messaging_service::register_gossip_digest_ack2(std::function<rpc::no_wait_type (gossip_digest_ack2)>&& func) {
     register_handler(this, messaging_verb::GOSSIP_DIGEST_ACK2, std::move(func));
 }
@@ -832,8 +732,8 @@ void messaging_service::register_read_data(std::function<future<foreign_ptr<lw_s
 void messaging_service::unregister_read_data() {
     _rpc->unregister_handler(net::messaging_verb::READ_DATA);
 }
-future<query::result> messaging_service::send_read_data(msg_addr id, const query::read_command& cmd, const query::partition_range& pr) {
-    return send_message<query::result>(this, messaging_verb::READ_DATA, std::move(id), cmd, pr);
+future<query::result> messaging_service::send_read_data(msg_addr id, clock_type::time_point timeout, const query::read_command& cmd, const query::partition_range& pr) {
+    return send_message_timeout<query::result>(this, messaging_verb::READ_DATA, std::move(id), timeout, cmd, pr);
 }
 
 void messaging_service::register_get_schema_version(std::function<future<frozen_schema>(unsigned, table_schema_version)>&& func) {
@@ -846,14 +746,24 @@ future<frozen_schema> messaging_service::send_get_schema_version(msg_addr dst, t
     return send_message<frozen_schema>(this, messaging_verb::GET_SCHEMA_VERSION, dst, static_cast<unsigned>(dst.cpu_id), v);
 }
 
+void messaging_service::register_schema_check(std::function<future<utils::UUID>()>&& func) {
+    register_handler(this, net::messaging_verb::SCHEMA_CHECK, std::move(func));
+}
+void messaging_service::unregister_schema_check() {
+    _rpc->unregister_handler(net::messaging_verb::SCHEMA_CHECK);
+}
+future<utils::UUID> messaging_service::send_schema_check(msg_addr dst) {
+    return send_message<utils::UUID>(this, net::messaging_verb::SCHEMA_CHECK, dst);
+}
+
 void messaging_service::register_read_mutation_data(std::function<future<foreign_ptr<lw_shared_ptr<reconcilable_result>>> (const rpc::client_info&, query::read_command cmd, query::partition_range pr)>&& func) {
     register_handler(this, net::messaging_verb::READ_MUTATION_DATA, std::move(func));
 }
 void messaging_service::unregister_read_mutation_data() {
     _rpc->unregister_handler(net::messaging_verb::READ_MUTATION_DATA);
 }
-future<reconcilable_result> messaging_service::send_read_mutation_data(msg_addr id, const query::read_command& cmd, const query::partition_range& pr) {
-    return send_message<reconcilable_result>(this, messaging_verb::READ_MUTATION_DATA, std::move(id), cmd, pr);
+future<reconcilable_result> messaging_service::send_read_mutation_data(msg_addr id, clock_type::time_point timeout, const query::read_command& cmd, const query::partition_range& pr) {
+    return send_message_timeout<reconcilable_result>(this, messaging_verb::READ_MUTATION_DATA, std::move(id), timeout, cmd, pr);
 }
 
 void messaging_service::register_read_digest(std::function<future<query::result_digest> (const rpc::client_info&, query::read_command cmd, query::partition_range pr)>&& func) {
@@ -862,8 +772,8 @@ void messaging_service::register_read_digest(std::function<future<query::result_
 void messaging_service::unregister_read_digest() {
     _rpc->unregister_handler(net::messaging_verb::READ_DIGEST);
 }
-future<query::result_digest> messaging_service::send_read_digest(msg_addr id, const query::read_command& cmd, const query::partition_range& pr) {
-    return send_message<query::result_digest>(this, net::messaging_verb::READ_DIGEST, std::move(id), cmd, pr);
+future<query::result_digest> messaging_service::send_read_digest(msg_addr id, clock_type::time_point timeout, const query::read_command& cmd, const query::partition_range& pr) {
+    return send_message_timeout<query::result_digest>(this, net::messaging_verb::READ_DIGEST, std::move(id), timeout, cmd, pr);
 }
 
 // Wrapper for TRUNCATE

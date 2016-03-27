@@ -34,6 +34,11 @@
 #include "core/thread.hh"
 #include "memtable.hh"
 
+#include "disk-error-handler.hh"
+
+thread_local disk_error_signal_type commit_error;
+thread_local disk_error_signal_type general_disk_error;
+
 using namespace std::chrono_literals;
 
 static schema_ptr make_schema() {
@@ -43,12 +48,29 @@ static schema_ptr make_schema() {
         .build();
 }
 
+static thread_local api::timestamp_type next_timestamp = 1;
+
 static
 mutation make_new_mutation(schema_ptr s, partition_key key) {
     mutation m(key, s);
     static thread_local int next_value = 1;
-    static thread_local api::timestamp_type next_timestamp = 1;
     m.set_clustered_cell(clustering_key::make_empty(*s), "v", data_value(to_bytes(sprint("v%d", next_value++))), next_timestamp++);
+    return m;
+}
+
+static inline
+mutation make_new_large_mutation(schema_ptr s, partition_key key) {
+    mutation m(key, s);
+    static thread_local int next_value = 1;
+    static constexpr size_t blob_size = 64 * 1024;
+    std::vector<int> data;
+    data.reserve(blob_size);
+    for (unsigned i = 0; i < blob_size; i++) {
+        data.push_back(next_value);
+    }
+    next_value++;
+    bytes b(reinterpret_cast<int8_t*>(data.data()), data.size() * sizeof(int));
+    m.set_clustered_cell(clustering_key::make_empty(*s), "v", data_value(std::move(b)), next_timestamp++);
     return m;
 }
 
@@ -63,18 +85,28 @@ mutation make_new_mutation(schema_ptr s) {
     return make_new_mutation(s, new_key(s));
 }
 
+static inline
+mutation make_new_large_mutation(schema_ptr s, int key) {
+    return make_new_large_mutation(s, partition_key::from_single_value(*s, to_bytes(sprint("key%d", key))));
+}
+
+static inline
+mutation make_new_mutation(schema_ptr s, int key) {
+    return make_new_mutation(s, partition_key::from_single_value(*s, to_bytes(sprint("key%d", key))));
+}
+
 SEASTAR_TEST_CASE(test_cache_delegates_to_underlying) {
     return seastar::async([] {
         auto s = make_schema();
         auto m = make_new_mutation(s);
 
         cache_tracker tracker;
-        row_cache cache(s, [m] (schema_ptr s, const query::partition_range&) {
+        row_cache cache(s, mutation_source([m] (schema_ptr s, const query::partition_range&) {
             assert(m.schema() == s);
             return make_reader_returning(m);
-        }, [m] (auto&&) {
+        }), key_source([m] (auto&&) {
             return make_key_from_mutation_reader(make_reader_returning(m));
-        }, tracker);
+        }), tracker);
 
         assert_that(cache.make_reader(s, query::full_partition_range))
             .produces(m)
@@ -88,12 +120,12 @@ SEASTAR_TEST_CASE(test_cache_works_after_clearing) {
         auto m = make_new_mutation(s);
 
         cache_tracker tracker;
-        row_cache cache(s, [m] (schema_ptr s, const query::partition_range&) {
+        row_cache cache(s, mutation_source([m] (schema_ptr s, const query::partition_range&) {
             assert(m.schema() == s);
             return make_reader_returning(m);
-        }, [m] (auto&&) {
+        }), key_source([m] (auto&&) {
             return make_key_from_mutation_reader(make_reader_returning(m));
-        }, tracker);
+        }), tracker);
 
         assert_that(cache.make_reader(s, query::full_partition_range))
             .produces(m)
@@ -209,9 +241,9 @@ SEASTAR_TEST_CASE(test_row_cache_conforms_to_mutation_source) {
             }
 
             auto cache = make_lw_shared<row_cache>(s, mt->as_data_source(), mt->as_key_source(), tracker);
-            return [cache] (schema_ptr s, const query::partition_range& range) {
+            return mutation_source([cache] (schema_ptr s, const query::partition_range& range) {
                 return cache->make_reader(s, range);
-            };
+            });
         });
     });
 }
@@ -274,7 +306,7 @@ SEASTAR_TEST_CASE(test_update) {
         cache_tracker tracker;
         row_cache cache(s, cache_mt->as_data_source(), cache_mt->as_key_source(), tracker);
 
-        BOOST_MESSAGE("Check cache miss with populate");
+        BOOST_TEST_MESSAGE("Check cache miss with populate");
 
         int partition_count = 1000;
 
@@ -310,7 +342,7 @@ SEASTAR_TEST_CASE(test_update) {
         std::copy(keys_not_in_cache.begin(), keys_not_in_cache.end(), std::back_inserter(keys_in_cache));
         keys_not_in_cache.clear();
 
-        BOOST_MESSAGE("Check cache miss with drop");
+        BOOST_TEST_MESSAGE("Check cache miss with drop");
 
         auto mt2 = make_lw_shared<memtable>(s);
 
@@ -329,7 +361,7 @@ SEASTAR_TEST_CASE(test_update) {
             verify_does_not_have(cache, key);
         }
 
-        BOOST_MESSAGE("Check cache hit with merge");
+        BOOST_TEST_MESSAGE("Check cache hit with merge");
 
         auto mt3 = make_lw_shared<memtable>(s);
 
@@ -349,6 +381,73 @@ SEASTAR_TEST_CASE(test_update) {
         }
     });
 }
+
+#ifndef DEFAULT_ALLOCATOR
+SEASTAR_TEST_CASE(test_update_failure) {
+    return seastar::async([] {
+        auto s = make_schema();
+        auto cache_mt = make_lw_shared<memtable>(s);
+
+        cache_tracker tracker;
+        row_cache cache(s, cache_mt->as_data_source(), cache_mt->as_key_source(), tracker);
+
+        int partition_count = 1000;
+
+        // populate cache with some partitions
+        for (int i = 0; i < partition_count / 2; i++) {
+            auto m = make_new_mutation(s, i + partition_count / 2);
+            cache.populate(m);
+        }
+
+        // populate memtable with more updated partitions
+        auto mt = make_lw_shared<memtable>(s);
+        using partitions_type = std::map<partition_key, mutation_partition, partition_key::less_compare>;
+        auto updated_partitions = partitions_type(partition_key::less_compare(*s));
+        for (int i = 0; i < partition_count; i++) {
+            auto m = make_new_large_mutation(s, i);
+            updated_partitions.emplace(m.key(), m.partition());
+            mt->apply(m);
+        }
+
+        // fill all transient memory
+        std::vector<bytes> memory_hog;
+        {
+            logalloc::reclaim_lock _(tracker.region());
+            try {
+                while (true) {
+                    memory_hog.emplace_back(bytes(bytes::initialized_later(), 4 * 1024));
+                }
+            } catch (const std::bad_alloc&) {
+                // expected
+            }
+        }
+
+        try {
+            cache.update(*mt, [] (auto&& key) {
+                return partition_presence_checker_result::definitely_doesnt_exist;
+            }).get();
+            BOOST_FAIL("updating cache should have failed");
+        } catch (const std::bad_alloc&) {
+            // expected
+        }
+
+        memory_hog.clear();
+
+        // verify that there are no stale partitions
+        auto reader = cache.make_reader(s, query::partition_range::make_open_ended_both_sides());
+        for (int i = 0; i < partition_count; i++) {
+            auto mopt = reader().get0();
+            if (!mopt) {
+                break;
+            }
+            auto it = updated_partitions.find(mopt->key());
+            BOOST_REQUIRE(it != updated_partitions.end());
+            BOOST_REQUIRE(it->second.equal(*s, mopt->partition()));
+        }
+        BOOST_REQUIRE(!reader().get0());
+    });
+}
+#endif
 
 class throttle {
     unsigned _block_counter = 0;
@@ -432,8 +531,10 @@ public:
         _impl->throttle().unblock();
     }
 
-    mutation_reader operator()(schema_ptr s, const query::partition_range& pr) {
-        return _impl->make_reader(s, pr);
+    operator mutation_source() const {
+        return mutation_source([this] (schema_ptr s, const query::partition_range& pr) {
+            return _impl->make_reader(std::move(s), pr);
+        });
     }
 };
 
@@ -449,20 +550,20 @@ SEASTAR_TEST_CASE(test_cache_population_and_update_race) {
     return seastar::async([] {
         auto s = make_schema();
         std::vector<lw_shared_ptr<memtable>> memtables;
-        auto memtables_data_source = [&] (schema_ptr s, const query::partition_range& pr) {
+        auto memtables_data_source = mutation_source([&] (schema_ptr s, const query::partition_range& pr) {
             std::vector<mutation_reader> readers;
             for (auto&& mt : memtables) {
                 readers.emplace_back(mt->make_reader(s, pr));
             }
             return make_combined_reader(std::move(readers));
-        };
-        auto memtables_key_source = [&] (const query::partition_range& pr) {
+        });
+        auto memtables_key_source = key_source([&] (const query::partition_range& pr) {
             std::vector<key_reader> readers;
             for (auto&& mt : memtables) {
                 readers.emplace_back(mt->as_key_source()(pr));
             }
             return make_combined_reader(s, std::move(readers));
-        };
+        });
         throttled_mutation_source cache_source(memtables_data_source);
         cache_tracker tracker;
         row_cache cache(s, cache_source, memtables_key_source, tracker);

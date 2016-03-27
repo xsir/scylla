@@ -83,6 +83,7 @@ logger::~logger() {
 
 void
 logger::really_do_log(log_level level, const char* fmt, stringer** s, size_t n) {
+    int syslog_offset = 0;
     std::ostringstream out;
     static array_map<sstring, 20> level_map = {
             { int(log_level::debug), "DEBUG" },
@@ -92,6 +93,17 @@ logger::really_do_log(log_level level, const char* fmt, stringer** s, size_t n) 
             { int(log_level::error), "ERROR" },
     };
     out << level_map[int(level)];
+    syslog_offset += 5;
+    if (_stdout.load(std::memory_order_relaxed)) {
+        auto now = std::chrono::system_clock::now();
+        auto residual_millis =
+                std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
+        auto tm = std::chrono::system_clock::to_time_t(now);
+        char tmp[100];
+        strftime(tmp, sizeof(tmp), " %Y-%m-%d %T", std::localtime(&tm));
+        out << tmp << sprint(",%03d", residual_millis);
+        syslog_offset += 24;
+    }
     out << " [shard " << engine().cpu_id() << "] " << _name << " - ";
     const char* p = fmt;
     while (*p != '\0') {
@@ -131,7 +143,7 @@ logger::really_do_log(log_level level, const char* fmt, stringer** s, size_t n) 
         //       we'll have to implement some internal buffering (which
         //       still means the problem can happen, just less frequently).
         // syslog() interprets % characters, so send msg as a parameter
-        syslog(level_map[int(level)], "%s", msg.c_str() + 5);
+        syslog(level_map[int(level)], "%s", msg.c_str() + syslog_offset);
     }
 }
 
@@ -246,6 +258,8 @@ std::ostream& operator<<(std::ostream& out, const std::exception_ptr& eptr) {
             out << " (error " << e.code() << ", " << e.code().message() << ")";
         } catch(const std::exception& e) {
             out << " (" << e.what() << ")";
+        } catch(...) {
+            // no extra info
         }
     }
     return out;

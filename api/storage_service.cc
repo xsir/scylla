@@ -280,10 +280,12 @@ void set_storage_service(http_context& ctx, routes& r) {
         return ctx.db.invoke_on_all([keyspace, column_families] (database& db) {
             std::vector<column_family*> column_families_vec;
             auto& cm = db.get_compaction_manager();
-            for (auto entry : column_families) {
-                column_family* cf = &db.find_column_family(keyspace, entry);
-                cm.submit_cleanup_job(cf);
+            for (auto cf : column_families) {
+                column_families_vec.push_back(&db.find_column_family(keyspace, cf));
             }
+            return parallel_for_each(column_families_vec, [&cm] (column_family* cf) {
+                return cm.perform_cleanup(cf);
+            });
         }).then([]{
             return make_ready_future<json::json_return_type>(0);
         });
@@ -326,7 +328,8 @@ void set_storage_service(http_context& ctx, routes& r) {
 
     ss::repair_async.set(r, [&ctx](std::unique_ptr<request> req) {
         static std::vector<sstring> options = {"primaryRange", "parallelism", "incremental",
-                "jobThreads", "ranges", "columnFamilies", "dataCenters", "hosts", "trace"};
+                "jobThreads", "ranges", "columnFamilies", "dataCenters", "hosts", "trace",
+                "startToken", "endToken" };
         std::unordered_map<sstring, sstring> options_map;
         for (auto o : options) {
             auto s = req->get_query_param(o);
@@ -585,6 +588,8 @@ void set_storage_service(http_context& ctx, routes& r) {
         auto val_str = req->get_query_param("value");
         bool value = (val_str == "True") || (val_str == "true") || (val_str == "1");
         return service::get_local_storage_service().db().invoke_on_all([value] (database& db) {
+            db.set_enable_incremental_backups(value);
+
             // Change both KS and CF, so they are in sync
             for (auto& pair: db.get_keyspaces()) {
                 auto& ks = pair.second;

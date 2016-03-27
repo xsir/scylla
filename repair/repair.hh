@@ -40,6 +40,11 @@ public:
     virtual const char* what() const noexcept override { return _what.c_str(); }
 };
 
+class repair_stopped_exception : public repair_exception {
+public:
+    repair_stopped_exception() : repair_exception("Repair stopped") { }
+};
+
 // NOTE: repair_start() can be run on any node, but starts a node-global
 // operation.
 // repair_start() starts the requested repair on this node. It returns an
@@ -58,6 +63,13 @@ enum class repair_status { RUNNING, SUCCESSFUL, FAILED };
 // different CPU (cpu 0) and that might be a deferring operation.
 future<repair_status> repair_get_status(seastar::sharded<database>& db, int id);
 
+// repair_shutdown() stops all ongoing repairs started on this node (and
+// prevents any further repairs from being started). It returns a future
+// saying when all repairs have stopped, and attempts to stop them as
+// quickly as possible (we do not wait for repairs to finish but rather
+// stop them abruptly).
+future<> repair_shutdown(seastar::sharded<database>& db);
+
 // The class partition_checksum calculates a 256-bit cryptographically-secure
 // checksum of a set of partitions fed to it. The checksum of a partition set
 // is calculated by calculating a strong hash function (SHA-256) of each
@@ -68,19 +80,16 @@ future<repair_status> repair_get_status(seastar::sharded<database>& db, int id);
 // The hash of an individual partition uses both its key and value.
 class partition_checksum {
 private:
-    uint64_t _digest[4]; // 256 bits
+    std::array<uint8_t, 32> _digest; // 256 bits
 public:
     constexpr partition_checksum() : _digest{} { }
+    explicit partition_checksum(std::array<uint8_t, 32> digest) : _digest(std::move(digest)) { }
     partition_checksum(const mutation& m);
     void add(const partition_checksum& other);
     bool operator==(const partition_checksum& other) const;
     bool operator!=(const partition_checksum& other) const { return !operator==(other); }
     friend std::ostream& operator<<(std::ostream&, const partition_checksum&);
-
-    // The following are used to send this object over messaging_service:
-    void serialize(bytes::iterator& out) const;
-    static partition_checksum deserialize(bytes_view& in);
-    size_t serialized_size() const;
+    const std::array<uint8_t, 32>& digest() const;
 };
 
 // Calculate the checksum of the data held on all shards of a column family,

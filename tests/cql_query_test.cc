@@ -36,6 +36,11 @@
 #include "transport/messages/result_message.hh"
 #include "utils/big_decimal.hh"
 
+#include "disk-error-handler.hh"
+
+thread_local disk_error_signal_type commit_error;
+thread_local disk_error_signal_type general_disk_error;
+
 using namespace std::literals::chrono_literals;
 
 SEASTAR_TEST_CASE(test_create_keyspace_statement) {
@@ -1913,6 +1918,13 @@ SEASTAR_TEST_CASE(test_compact_storage) {
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(3), {}, int32_type->decompose(6) },
             });
+            return e.execute_cql("create table tcs4 (p1 int PRIMARY KEY, c1 int, c2 int) with compact storage;").discard_result();
+        }).then([&e] {
+            return e.execute_cql("insert into tcs4 (p1) values (1);").discard_result();
+        }).then([&e] {
+            return e.execute_cql("select * from tcs4;");
+        }).then([&e] (auto msg) {
+            assert_that(msg).is_rows().with_rows({ });
         });
     });
 }
@@ -2018,7 +2030,7 @@ SEASTAR_TEST_CASE(test_frozen_collections) {
         }).then([&e, frozen_map_of_set_and_list] (auto msg) {
             map_type_impl::mutation_view empty_mv{};
             assert_that(msg).is_rows().with_rows({
-                { int32_type->decompose(0), int32_type->decompose(0), frozen_map_of_set_and_list->to_value(empty_mv, serialization_format::internal()), int32_type->decompose(0) },
+                { int32_type->decompose(0), int32_type->decompose(0), frozen_map_of_set_and_list->to_value(empty_mv, cql_serialization_format::internal()), int32_type->decompose(0) },
             });
         });
     });

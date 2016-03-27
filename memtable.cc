@@ -50,7 +50,9 @@ memtable::find_or_create_partition_slow(partition_key_view key) {
     return with_allocator(standard_allocator(), [&, this] () -> mutation_partition& {
         auto dk = dht::global_partitioner().decorate_key(*_schema, key);
         return with_allocator(outer, [&dk, this] () -> mutation_partition& {
+          return with_linearized_managed_bytes([&] () -> mutation_partition& {
             return find_or_create_partition(dk);
+          });
         });
     });
 }
@@ -112,6 +114,7 @@ class scanning_reader final : public mutation_reader::impl {
     size_t _last_partition_count = 0;
     stdx::optional<query::partition_range> _delegate_range;
     mutation_reader _delegate;
+    const io_priority_class& _pc;
 private:
     memtable::partitions_type::iterator lookup_end() {
         auto cmp = partition_entry::compare(_memtable->_schema);
@@ -145,10 +148,11 @@ private:
         _last_reclaim_counter = current_reclaim_counter;
     }
 public:
-    scanning_reader(schema_ptr s, lw_shared_ptr<memtable> m, const query::partition_range& range)
+    scanning_reader(schema_ptr s, lw_shared_ptr<memtable> m, const query::partition_range& range, const io_priority_class& pc)
         : _memtable(std::move(m))
         , _schema(std::move(s))
         , _range(range)
+        , _pc(pc)
     { }
 
     virtual future<mutation_opt> operator()() override {
@@ -161,13 +165,14 @@ public:
             // FIXME: Use cache. See column_family::make_reader().
             _delegate_range = _last ? _range.split_after(*_last, dht::ring_position_comparator(*_memtable->_schema)) : _range;
             _delegate = make_mutation_reader<sstable_range_wrapping_reader>(
-                _memtable->_sstable, _schema, *_delegate_range);
+                _memtable->_sstable, _schema, *_delegate_range, _pc);
             _memtable = {};
             _last = {};
             return _delegate();
         }
 
         logalloc::reclaim_lock _(_memtable->_region);
+        managed_bytes::linearization_context_guard lcg;
         update_iterators();
         if (_i == _end) {
             return make_ready_future<mutation_opt>(stdx::nullopt);
@@ -181,7 +186,7 @@ public:
 };
 
 mutation_reader
-memtable::make_reader(schema_ptr s, const query::partition_range& range) {
+memtable::make_reader(schema_ptr s, const query::partition_range& range, const io_priority_class& pc) {
     if (query::is_wrap_around(range, *s)) {
         fail(unimplemented::cause::WRAP_AROUND);
     }
@@ -189,6 +194,7 @@ memtable::make_reader(schema_ptr s, const query::partition_range& range) {
     if (query::is_single_partition(range)) {
         const query::ring_position& pos = range.start()->value();
         return _read_section(_region, [&] {
+        managed_bytes::linearization_context_guard lcg;
         auto i = partitions.find(pos, partition_entry::compare(_schema));
         if (i != partitions.end()) {
             upgrade_entry(*i);
@@ -198,7 +204,7 @@ memtable::make_reader(schema_ptr s, const query::partition_range& range) {
         }
         });
     } else {
-        return make_mutation_reader<scanning_reader>(std::move(s), shared_from_this(), range);
+        return make_mutation_reader<scanning_reader>(std::move(s), shared_from_this(), range, pc);
     }
 }
 
@@ -223,8 +229,10 @@ void
 memtable::apply(const mutation& m, const db::replay_position& rp) {
     with_allocator(_region.allocator(), [this, &m] {
         _allocating_section(_region, [&, this] {
+          with_linearized_managed_bytes([&] {
             mutation_partition& p = find_or_create_partition(m.decorated_key());
             p.apply(*_schema, m.partition(), *m.schema());
+          });
         });
     });
     update(rp);
@@ -234,8 +242,10 @@ void
 memtable::apply(const frozen_mutation& m, const schema_ptr& m_schema, const db::replay_position& rp) {
     with_allocator(_region.allocator(), [this, &m, &m_schema] {
         _allocating_section(_region, [&, this] {
+          with_linearized_managed_bytes([&] {
             mutation_partition& p = find_or_create_partition_slow(m.key(*_schema));
             p.apply(*_schema, m.partition(), *m_schema);
+          });
         });
     });
     update(rp);
@@ -246,15 +256,15 @@ logalloc::occupancy_stats memtable::occupancy() const {
 }
 
 mutation_source memtable::as_data_source() {
-    return [mt = shared_from_this()] (schema_ptr s, const query::partition_range& range) {
+    return mutation_source([mt = shared_from_this()] (schema_ptr s, const query::partition_range& range) {
         return mt->make_reader(std::move(s), range);
-    };
+    });
 }
 
 key_source memtable::as_key_source() {
-    return [mt = shared_from_this()] (const query::partition_range& range) {
+    return key_source([mt = shared_from_this()] (const query::partition_range& range) {
         return make_key_from_mutation_reader(mt->make_reader(mt->_schema, range));
-    };
+    });
 }
 
 size_t memtable::partition_count() const {
@@ -290,8 +300,10 @@ void memtable::upgrade_entry(partition_entry& e) {
     if (e._schema != _schema) {
         assert(!_region.reclaiming_enabled());
         with_allocator(_region.allocator(), [this, &e] {
+          with_linearized_managed_bytes([&] {
             e._p.upgrade(*e._schema, *_schema);
             e._schema = _schema;
+          });
         });
     }
 }

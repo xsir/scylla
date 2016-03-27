@@ -66,6 +66,10 @@ private:
     // Queue shared among all tasks containing all column families to be cleaned up.
     std::deque<column_family*> _cfs_to_cleanup;
 
+    // Used to wake up a caller of perform_cleanup() which is waiting for termination
+    // of cleanup operation.
+    std::unordered_map<column_family*, promise<>> _cleanup_waiters;
+
     // Used to assert that compaction_manager was explicitly stopped, if started.
     bool _stopped = true;
 
@@ -73,6 +77,10 @@ private:
     std::vector<scollectd::registration> _registrations;
 
     std::list<lw_shared_ptr<sstables::compaction_info>> _compactions;
+
+    // Store sstables that are being compacted at the moment. That's needed to prevent
+    // a sstable from being compacted twice.
+    std::unordered_set<sstables::shared_sstable> _compacting_sstables;
 private:
     void task_start(lw_shared_ptr<task>& task);
     future<> task_stop(lw_shared_ptr<task>& task);
@@ -102,8 +110,8 @@ public:
     // Submit a column family to be compacted.
     void submit(column_family* cf);
 
-    // Submit a column family to be cleaned up.
-    void submit_cleanup_job(column_family* cf);
+    // Submit a column family to be cleaned up and wait for its termination.
+    future<> perform_cleanup(column_family* cf);
 
     // Remove a column family from the compaction manager.
     // Cancel requests on cf and wait for a possible ongoing compaction on cf.

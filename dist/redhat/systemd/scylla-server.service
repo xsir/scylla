@@ -1,6 +1,5 @@
 [Unit]
 Description=Scylla Server
-After=network.target
 
 [Service]
 Type=notify
@@ -8,13 +7,16 @@ LimitMEMLOCK=infinity
 LimitNOFILE=200000
 LimitAS=infinity
 LimitNPROC=8096
+WorkingDirectory=/var/lib/scylla
+Environment="HOME=/var/lib/scylla"
 EnvironmentFile=/etc/sysconfig/scylla-server
+EnvironmentFile=/etc/scylla.d/*.conf
 ExecStartPre=/usr/bin/sudo -E /usr/lib/scylla/scylla_prepare
-ExecStart=/usr/lib/scylla/scylla_run
+ExecStart=/usr/bin/scylla $SCYLLA_ARGS $SEASTAR_IO $DEV_MODE
 ExecStopPost=/usr/bin/sudo -E /usr/lib/scylla/scylla_stop
 TimeoutStartSec=900
 KillMode=process
-Restart=no
+Restart=on-abnormal
 User=scylla
 
 [Install]

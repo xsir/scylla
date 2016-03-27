@@ -26,7 +26,7 @@
 #include "thrift/server.hh"
 #include "transport/server.hh"
 #include "http/httpd.hh"
-#include "api/api.hh"
+#include "api/api_init.hh"
 #include "db/config.hh"
 #include "service/storage_service.hh"
 #include "service/migration_manager.hh"
@@ -43,10 +43,12 @@
 #include "debug.hh"
 #include "init.hh"
 #include "release.hh"
+#include "repair/repair.hh"
 #include <cstdio>
 #include <core/file.hh>
 #include <sys/time.h>
 #include <sys/resource.h>
+#include "disk-error-handler.hh"
 
 #ifdef HAVE_LIBSYSTEMD
 #include <systemd/sd-daemon.h>
@@ -54,15 +56,19 @@
 
 logging::logger startlog("init");
 
-static bool started_by_upstart = false;
+thread_local disk_error_signal_type commit_error;
+thread_local disk_error_signal_type general_disk_error;
+
 void
 supervisor_notify(sstring msg, bool ready = false) {
+    static const char *is_upstart = getenv("UPSTART_JOB");
+
     startlog.trace("{}", msg);
 #ifdef HAVE_LIBSYSTEMD
     auto ready_msg = ready ? "READY=1\n" : "";
     sd_notify(0, sprint("%sSTATUS=%s\n", ready_msg, msg).c_str());
 #endif
-    if (started_by_upstart) {
+    if (is_upstart != nullptr && ready) {
         raise(SIGSTOP);
     }
 }
@@ -156,7 +162,7 @@ static void apply_logger_settings(sstring default_level, db::config::string_map 
 class directories {
 public:
     future<> touch_and_lock(sstring path) {
-        return recursive_touch_directory(path).then_wrapped([this, path] (future<> f) {
+        return io_check(recursive_touch_directory, path).then_wrapped([this, path] (future<> f) {
             try {
                 f.get();
                 return utils::file_lock::acquire(path + "/.lock").then([this](utils::file_lock lock) {
@@ -219,7 +225,47 @@ verify_rlimit(bool developer_mode) {
     }
 }
 
+static bool cpu_sanity() {
+    if (!__builtin_cpu_supports("sse4.2")) {
+        std::cerr << "Scylla requires a processor with SSE 4.2 support\n";
+        return false;
+    }
+    return true;
+}
+
+static future<>
+verify_seastar_io_scheduler(bool has_max_io_requests, bool developer_mode) {
+    auto note_bad_conf = [developer_mode] (sstring cause) {
+        sstring msg = "I/O Scheduler is not properly configured! This is a non-supported setup, and performance is expected to be unpredictably bad.\n Reason found: "
+                    + cause + "\n"
+                    + "To properly configure the I/O Scheduler, run the scylla_io_setup utility shipped with Scylla.\n";
+
+        sstring devmode_msg = msg + "To ignore this, see the developer_mode configuration option.";
+        if (developer_mode) {
+            startlog.warn(msg.c_str());
+        } else {
+            startlog.error(devmode_msg.c_str());
+            throw std::runtime_error("Bad I/O Scheduler configuration");
+        }
+    };
+
+    if (!has_max_io_requests) {
+        note_bad_conf("--max-io-requests is not set.");
+    }
+    return smp::invoke_on_all([developer_mode, note_bad_conf] {
+        auto capacity = engine().get_io_queue().capacity();
+        if (capacity < 4) {
+            auto cause = sprint("I/O Queue capacity for this shard is too low (%ld, minimum 4 expected).", capacity);
+            note_bad_conf(cause);
+        }
+    });
+}
+
 int main(int ac, char** av) {
+    // early check to avoid triggering
+    if (!cpu_sanity()) {
+        _exit(71);
+    }
     runtime::init_uptime();
     std::setvbuf(stdout, nullptr, _IOLBF, 1000);
     app_template app;
@@ -231,7 +277,6 @@ int main(int ac, char** av) {
         // TODO : default, always read?
         ("options-file", bpo::value<sstring>(), "configuration file (i.e. <SCYLLA_HOME>/conf/scylla.yaml)")
         ("help-loggers", bpo::bool_switch(&help_loggers), "print a list of logger names and exit")
-        ("started-by-upstart", bpo::bool_switch(&started_by_upstart), "specify init type as upstart")
         ;
 
     distributed<database> db;
@@ -263,7 +308,8 @@ int main(int ac, char** av) {
             engine().set_strict_dma(false);
         }
 
-        return read_config(opts, *cfg).then([cfg, &db, &qp, &proxy, &mm, &ctx, &opts, &dirs]() {
+        return seastar::async([cfg, &db, &qp, &proxy, &mm, &ctx, &opts, &dirs] {
+            read_config(opts, *cfg).get();
             apply_logger_settings(cfg->default_log_level(), cfg->logger_log_level(),
                     cfg->log_to_stdout(), cfg->log_to_syslog());
             verify_rlimit(cfg->developer_mode());
@@ -279,9 +325,19 @@ int main(int ac, char** av) {
             sstring broadcast_rpc_address = cfg->broadcast_rpc_address();
 
             if (!broadcast_address.empty()) {
-                utils::fb_utilities::set_broadcast_address(broadcast_address);
+                try {
+                    utils::fb_utilities::set_broadcast_address(broadcast_address);
+                } catch (...) {
+                    startlog.error("Bad configuration: invalid 'broadcast_address': {}: {}", broadcast_address, std::current_exception());
+                    throw bad_configuration_error();
+                }
             } else if (!listen_address.empty()) {
-                utils::fb_utilities::set_broadcast_address(listen_address);
+                try {
+                    utils::fb_utilities::set_broadcast_address(listen_address);
+                } catch (...) {
+                    startlog.error("Bad configuration: invalid 'listen_address': {}: {}", listen_address, std::current_exception());
+                    throw bad_configuration_error();
+                }
             } else {
                 startlog.error("Bad configuration: neither listen_address nor broadcast_address are defined\n");
                 throw bad_configuration_error();
@@ -319,205 +375,202 @@ int main(int ac, char** av) {
             using namespace locator;
             // Re-apply strict-dma after we've read the config file, this time
             // to all reactors
-            return parallel_for_each(boost::irange(0u, smp::count), [devmode = opts.count("developer-mode")] (unsigned cpu) {
-                if (devmode) {
-                    engine().set_strict_dma(false);
-                }
-                return make_ready_future<>();
-            }).then([cfg] {
-                supervisor_notify("creating snitch");
-                return i_endpoint_snitch::create_snitch(cfg->endpoint_snitch());
-                // #293 - do not stop anything
-                // engine().at_exit([] { return i_endpoint_snitch::stop_snitch(); });
-            }).then([&db] {
-                supervisor_notify("initializing storage service");
-                return init_storage_service(db);
-            }).then([&db, cfg] {
-                supervisor_notify("starting per-shard database core");
-                // Note: changed from using a move here, because we want the config object intact.
-                return db.start(std::ref(*cfg)).then([&db] {
-                    engine().at_exit([&db] {
-
-                        // #293 - do not stop anything - not even db (for real)
-                        //return db.stop();
-                        // call stop on each db instance, but leave the shareded<database> pointers alive.
-                        return db.invoke_on_all([](auto& db) {
-                            return db.stop();
-                        }).then([] {
-                            ::_exit(3);
-                        });
-                    });
-                });
-            }).then([cfg, listen_address] {
-                supervisor_notify("starting gossip");
-                // Moved local parameters here, esp since with the
-                // ssl stuff it gets to be a lot.
-                uint16_t storage_port = cfg->storage_port();
-                uint16_t ssl_storage_port = cfg->ssl_storage_port();
-                double phi = cfg->phi_convict_threshold();
-                auto seed_provider= cfg->seed_provider();
-                sstring cluster_name = cfg->cluster_name();
-
-                const auto& ssl_opts = cfg->server_encryption_options();
-                auto encrypt_what = get_or_default(ssl_opts, "internode_encryption", "none");
-                auto trust_store = get_or_default(ssl_opts, "truststore");
-                auto cert = get_or_default(ssl_opts, "certificate", relative_conf_dir("scylla.crt").string());
-                auto key = get_or_default(ssl_opts, "keyfile", relative_conf_dir("scylla.key").string());
-
-                return init_ms_fd_gossiper(listen_address
-                                , storage_port
-                                , ssl_storage_port
-                                , encrypt_what
-                                , trust_store
-                                , cert
-                                , key
-                                , seed_provider
-                                , cluster_name
-                                , phi);
-            }).then([&db] {
-                supervisor_notify("starting streaming service");
-                return streaming::stream_session::init_streaming_service(db);
-            }).then([&db] {
-                supervisor_notify("starting messaging service");
-                // Start handling REPAIR_CHECKSUM_RANGE messages
-                return net::get_messaging_service().invoke_on_all([&db] (auto& ms) {
-                    ms.register_repair_checksum_range([&db] (sstring keyspace, sstring cf, query::range<dht::token> range) {
-                       return do_with(std::move(keyspace), std::move(cf), std::move(range),
-                               [&db] (auto& keyspace, auto& cf, auto& range) {
-                           return checksum_range(db, keyspace, cf, range);
-                       });
-                    });
-                });
-            }).then([&proxy, &db] {
-                supervisor_notify("starting storage proxy");
-                return proxy.start(std::ref(db)).then([&proxy] {
-                    // #293 - do not stop anything
-                    // engine().at_exit([&proxy] { return proxy.stop(); });
-                });
-            }).then([&mm] {
-                supervisor_notify("starting migration manager");
-                return mm.start().then([&mm] {
-                    // #293 - do not stop anything
-                    // engine().at_exit([&mm] { return mm.stop(); });
-                });
-            }).then([&db, &proxy, &qp] {
-                supervisor_notify("starting query processor");
-                return qp.start(std::ref(proxy), std::ref(db)).then([&qp] {
-                    // #293 - do not stop anything
-                    // engine().at_exit([&qp] { return qp.stop(); });
-                });
-            }).then([&qp] {
-                supervisor_notify("initializing batchlog manager");
-                return db::get_batchlog_manager().start(std::ref(qp)).then([] {
-                    // #293 - do not stop anything
-                    // engine().at_exit([] { return db::get_batchlog_manager().stop(); });
-                });
-            }).then([&db, &dirs] {
-                supervisor_notify("creating data directories");
-                return dirs.touch_and_lock(db.local().get_config().data_file_directories());
-            }).then([&db, &dirs] {
-                supervisor_notify("creating commitlog directory");
-                return dirs.touch_and_lock(db.local().get_config().commitlog_directory());
-            }).then([&db] {
-                supervisor_notify("verifying data and commitlog directories");
-                std::unordered_set<sstring> directories;
-                directories.insert(db.local().get_config().data_file_directories().cbegin(),
-                        db.local().get_config().data_file_directories().cend());
-                directories.insert(db.local().get_config().commitlog_directory());
-                return do_with(std::move(directories), [&db] (auto& directories) {
-                    return parallel_for_each(directories, [&db] (sstring pathname) {
-                        return disk_sanity(pathname, db.local().get_config().developer_mode());
-                    });
-                });
-            }).then([&db] {
-                supervisor_notify("loading sstables");
-                return db.invoke_on_all([] (database& db) {
-                    return db.init_system_keyspace();
-                }).then([&db] {
-                    auto& ks = db.local().find_keyspace(db::system_keyspace::NAME);
-                    return parallel_for_each(ks.metadata()->cf_meta_data(), [&ks] (auto& pair) {
-                        auto cfm = pair.second;
-                        return ks.make_directory_for_column_family(cfm->cf_name(), cfm->id());
-                    });
-                });
-            }).then([&db, &proxy] {
-                supervisor_notify("loading sstables");
-                return db.invoke_on_all([&proxy] (database& db) {
-                    return db.load_sstables(proxy);
-                });
-            }).then([&db, &qp] {
-                supervisor_notify("setting up system keyspace");
-                return db::system_keyspace::setup(db, qp);
-            }).then([&db, &qp] {
-                supervisor_notify("starting commit log");
-                auto cl = db.local().commitlog();
-                if (cl == nullptr) {
-                    return make_ready_future<>();
-                }
-                return cl->list_existing_segments().then([&db, &qp](auto paths) {
-                    if (paths.empty()) {
-                        return make_ready_future<>();
-                    }
-                    supervisor_notify("replaying commit log");
-                    return db::commitlog_replayer::create_replayer(qp).then([paths](auto rp) {
-                        return do_with(std::move(rp), [paths = std::move(paths)](auto& rp) {
-                            return rp.recover(paths);
-                        });
-                    }).then([&db] {
-                        supervisor_notify("replaying commit log - flushing memtables");
-                        return db.invoke_on_all([] (database& db) {
-                            return db.flush_all_memtables();
-                        });
-                    }).then([paths] {
-                        supervisor_notify("replaying commit log - removing old commitlog segments");
-                        for (auto& path : paths) {
-                            ::unlink(path.c_str());
-                        }
-                    });
-                });
-            }).then([] {
-                supervisor_notify("starting storage service");
-                auto& ss = service::get_local_storage_service();
-                return ss.init_server();
-            }).then([] {
-                supervisor_notify("starting batchlog manager");
-                return db::get_batchlog_manager().invoke_on_all([] (db::batchlog_manager& b) {
-                    return b.start();
-                });
-            }).then([&db] {
-                supervisor_notify("starting load broadcaster");
-                // should be unique_ptr, but then lambda passed to at_exit will be non copieable and
-                // casting to std::function<> will fail to compile
-                auto lb = make_shared<service::load_broadcaster>(db, gms::get_local_gossiper());
-                lb->start_broadcasting();
-                service::get_local_storage_service().set_load_broadcaster(lb);
-                engine().at_exit([lb = std::move(lb)] () mutable { return lb->stop_broadcasting(); });
-            }).then([] {
-                return gms::get_local_gossiper().wait_for_gossip_to_settle();
-            }).then([start_thrift] () {
-                supervisor_notify("starting native transport");
-                return service::get_local_storage_service().start_native_transport().then([start_thrift] () {
-                    if (start_thrift) {
-                        return service::get_local_storage_service().start_rpc_server();
-                    }
-                    return make_ready_future<>();
-                });
-            }).then([api_address] {
-                supervisor_notify("determining DNS name");
-                return dns::gethostbyname(api_address);
-            }).then([&db, api_address, api_port, &ctx] (dns::hostent e){
-                supervisor_notify("starting API server");
-                auto ip = e.addresses[0].in.s_addr;
-                return ctx.http_server.start().then([api_address, api_port, ip, &ctx] {
-                    return set_server(ctx);
-                }).then([api_address, api_port, ip, &ctx] {
-                    return ctx.http_server.listen(ipv4_addr{ip, api_port});
-                }).then([api_address, api_port] {
-                    print("Scylla API server listening on %s:%s ...\n", api_address, api_port);
+            if (opts.count("developer-mode")) {
+                smp::invoke_on_all([] { engine().set_strict_dma(false); }).get();
+            }
+            supervisor_notify("creating snitch");
+            i_endpoint_snitch::create_snitch(cfg->endpoint_snitch()).get();
+            // #293 - do not stop anything
+            // engine().at_exit([] { return i_endpoint_snitch::stop_snitch(); });
+            supervisor_notify("determining DNS name");
+            dns::hostent e = dns::gethostbyname(api_address).get0();
+            supervisor_notify("starting API server");
+            auto ip = e.addresses[0].in.s_addr;
+            ctx.http_server.start().get();
+            api::set_server_init(ctx).get();
+            ctx.http_server.listen(ipv4_addr{ip, api_port}).get();
+            print("Scylla API server listening on %s:%s ...\n", api_address, api_port);
+            supervisor_notify("initializing storage service");
+            init_storage_service(db);
+            supervisor_notify("starting per-shard database core");
+            // Note: changed from using a move here, because we want the config object intact.
+            db.start(std::ref(*cfg)).get();
+            engine().at_exit([&db] {
+                // #293 - do not stop anything - not even db (for real)
+                //return db.stop();
+                // call stop on each db instance, but leave the shareded<database> pointers alive.
+                return db.invoke_on_all([](auto& db) {
+                    return db.stop();
+                }).then([] {
+                        return sstables::await_background_jobs_on_all_shards();
+                }).then([] {
+                        ::_exit(0);
                 });
             });
-        }).then([] {
-            supervisor_notify("serving", true);
+            verify_seastar_io_scheduler(opts.count("max-io-requests"), db.local().get_config().developer_mode()).get();
+            supervisor_notify("creating data directories");
+            dirs.touch_and_lock(db.local().get_config().data_file_directories()).get();
+            supervisor_notify("creating commitlog directory");
+            dirs.touch_and_lock(db.local().get_config().commitlog_directory()).get();
+            supervisor_notify("verifying data and commitlog directories");
+            std::unordered_set<sstring> directories;
+            directories.insert(db.local().get_config().data_file_directories().cbegin(),
+                    db.local().get_config().data_file_directories().cend());
+            directories.insert(db.local().get_config().commitlog_directory());
+            parallel_for_each(directories, [&db] (sstring pathname) {
+                return disk_sanity(pathname, db.local().get_config().developer_mode());
+            }).get();
+
+            // Deletion of previous stale, temporary SSTables is done by Shard0. Therefore,
+            // let's run Shard0 first. Technically, we could just have all shards agree on
+            // the deletion and just delete it later, but that is prone to races.
+            //
+            // Those races are not supposed to happen during normal operation, but if we have
+            // bugs, they can. Scylla's Github Issue #1014 is an example of a situation where
+            // that can happen, making existing problems worse. So running a single shard first
+            // and getting making sure that all temporary tables are deleted provides extra
+            // protection against such situations.
+            db.invoke_on(0, [] (database& db) { return db.init_system_keyspace(); }).get();
+            db.invoke_on_all([] (database& db) {
+                if (engine().cpu_id() == 0) {
+                    return make_ready_future<>();
+                }
+                return db.init_system_keyspace();
+            }).get();
+            supervisor_notify("starting gossip");
+            // Moved local parameters here, esp since with the
+            // ssl stuff it gets to be a lot.
+            uint16_t storage_port = cfg->storage_port();
+            uint16_t ssl_storage_port = cfg->ssl_storage_port();
+            double phi = cfg->phi_convict_threshold();
+            auto seed_provider= cfg->seed_provider();
+            sstring cluster_name = cfg->cluster_name();
+
+            const auto& ssl_opts = cfg->server_encryption_options();
+            auto encrypt_what = get_or_default(ssl_opts, "internode_encryption", "none");
+            auto trust_store = get_or_default(ssl_opts, "truststore");
+            auto cert = get_or_default(ssl_opts, "certificate", relative_conf_dir("scylla.crt").string());
+            auto key = get_or_default(ssl_opts, "keyfile", relative_conf_dir("scylla.key").string());
+
+            init_ms_fd_gossiper(listen_address
+                    , storage_port
+                    , ssl_storage_port
+                    , encrypt_what
+                    , trust_store
+                    , cert
+                    , key
+                    , seed_provider
+                    , cluster_name
+                    , phi);
+            supervisor_notify("starting messaging service");
+            supervisor_notify("starting storage proxy");
+            proxy.start(std::ref(db)).get();
+            // #293 - do not stop anything
+            // engine().at_exit([&proxy] { return proxy.stop(); });
+            supervisor_notify("starting migration manager");
+            mm.start().get();
+            // #293 - do not stop anything
+            // engine().at_exit([&mm] { return mm.stop(); });
+            supervisor_notify("starting query processor");
+            qp.start(std::ref(proxy), std::ref(db)).get();
+            // #293 - do not stop anything
+            // engine().at_exit([&qp] { return qp.stop(); });
+            supervisor_notify("initializing batchlog manager");
+            db::get_batchlog_manager().start(std::ref(qp)).get();
+            // #293 - do not stop anything
+            // engine().at_exit([] { return db::get_batchlog_manager().stop(); });
+            supervisor_notify("loading sstables");
+            auto& ks = db.local().find_keyspace(db::system_keyspace::NAME);
+            parallel_for_each(ks.metadata()->cf_meta_data(), [&ks] (auto& pair) {
+                auto cfm = pair.second;
+                return ks.make_directory_for_column_family(cfm->cf_name(), cfm->id());
+            }).get();
+            supervisor_notify("loading sstables");
+            // See comment on top of our call to init_system_keyspace as per why we invoke
+            // on Shard0 first. Scylla's Github Issue #1014 for details
+            db.invoke_on(0, [&proxy] (database& db) { return db.load_sstables(proxy); }).get();
+            db.invoke_on_all([&proxy] (database& db) {
+                if (engine().cpu_id() == 0) {
+                    return make_ready_future<>();
+                }
+                return db.load_sstables(proxy);
+            }).get();
+            supervisor_notify("setting up system keyspace");
+            db::system_keyspace::setup(db, qp).get();
+            supervisor_notify("starting commit log");
+            auto cl = db.local().commitlog();
+            if (cl != nullptr) {
+                auto paths = cl->list_existing_segments().get0();
+                if (!paths.empty()) {
+                    supervisor_notify("replaying commit log");
+                    auto rp = db::commitlog_replayer::create_replayer(qp).get0();
+                    rp.recover(paths).get();
+                    supervisor_notify("replaying commit log - flushing memtables");
+                    db.invoke_on_all([] (database& db) {
+                        return db.flush_all_memtables();
+                    }).get();
+                    supervisor_notify("replaying commit log - removing old commitlog segments");
+                    for (auto& path : paths) {
+                        ::unlink(path.c_str());
+                    }
+                }
+            }
+            api::set_server_storage_service(ctx).get();
+            api::set_server_gossip(ctx).get();
+            api::set_server_messaging_service(ctx).get();
+            api::set_server_storage_proxy(ctx).get();
+            api::set_server_load_sstable(ctx).get();
+            supervisor_notify("initializing migration manager RPC verbs");
+            service::get_migration_manager().invoke_on_all([] (auto& mm) {
+                mm.init_messaging_service();
+            }).get();
+            supervisor_notify("initializing storage proxy RPC verbs");
+            proxy.invoke_on_all([] (service::storage_proxy& p) {
+                p.init_messaging_service();
+            }).get();
+            supervisor_notify("starting streaming service");
+            streaming::stream_session::init_streaming_service(db).get();
+            api::set_server_stream_manager(ctx).get();
+            // Start handling REPAIR_CHECKSUM_RANGE messages
+            net::get_messaging_service().invoke_on_all([&db] (auto& ms) {
+                ms.register_repair_checksum_range([&db] (sstring keyspace, sstring cf, query::range<dht::token> range) {
+                    return do_with(std::move(keyspace), std::move(cf), std::move(range),
+                            [&db] (auto& keyspace, auto& cf, auto& range) {
+                        return checksum_range(db, keyspace, cf, range);
+                    });
+                });
+            }).get();
+            supervisor_notify("starting storage service", true);
+            auto& ss = service::get_local_storage_service();
+            ss.init_server().get();
+            api::set_server_storage_service(ctx).get();
+            supervisor_notify("starting batchlog manager");
+            db::get_batchlog_manager().invoke_on_all([] (db::batchlog_manager& b) {
+                return b.start();
+            }).get();
+            supervisor_notify("starting load broadcaster");
+            // should be unique_ptr, but then lambda passed to at_exit will be non copieable and
+            // casting to std::function<> will fail to compile
+            auto lb = make_shared<service::load_broadcaster>(db, gms::get_local_gossiper());
+            lb->start_broadcasting();
+            service::get_local_storage_service().set_load_broadcaster(lb);
+            engine().at_exit([lb = std::move(lb)] () mutable { return lb->stop_broadcasting(); });
+            gms::get_local_gossiper().wait_for_gossip_to_settle().get();
+            api::set_server_gossip_settle(ctx).get();
+            supervisor_notify("starting native transport");
+            service::get_local_storage_service().start_native_transport().get();
+            if (start_thrift) {
+                service::get_local_storage_service().start_rpc_server().get();
+            }
+            api::set_server_done(ctx).get();
+            supervisor_notify("serving");
+            // Register at_exit last, so that storage_service::drain_on_shutdown will be called first
+            engine().at_exit([] {
+                return service::get_local_storage_service().drain_on_shutdown();
+            });
+            engine().at_exit([] {
+                return repair_shutdown(service::get_local_storage_service().db());
+            });
         }).or_terminate();
     });
 }

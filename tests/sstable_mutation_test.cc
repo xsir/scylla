@@ -35,6 +35,11 @@
 #include "mutation_source_test.hh"
 #include "tmpdir.hh"
 
+#include "disk-error-handler.hh"
+
+thread_local disk_error_signal_type commit_error;
+thread_local disk_error_signal_type general_disk_error;
+
 using namespace sstables;
 
 SEASTAR_TEST_CASE(nonexistent_key) {
@@ -311,7 +316,7 @@ future<> test_range_reads(const dht::token& min, const dht::token& max, std::vec
                     return mutations.read().then([&expected, expected_size, count, stop] (mutation_opt mutation) mutable {
                         if (mutation) {
                             BOOST_REQUIRE(*count < expected_size);
-                            BOOST_REQUIRE(bytes_view(expected.back()) == bytes_view(mutation->key()));
+                            BOOST_REQUIRE(std::vector<bytes>({expected.back()}) == mutation->key().explode());
                             expected.pop_back();
                             (*count)++;
                         } else {
@@ -346,9 +351,9 @@ SEASTAR_TEST_CASE(read_partial_range_2) {
 }
 
 ::mutation_source as_mutation_source(lw_shared_ptr<sstables::sstable> sst) {
-    return [sst] (schema_ptr s, const query::partition_range& range) mutable {
+    return mutation_source([sst] (schema_ptr s, const query::partition_range& range) mutable {
         return as_mutation_reader(sst, sst->read_range_rows(s, range));
-    };
+    });
 }
 
 SEASTAR_TEST_CASE(test_sstable_conforms_to_mutation_source) {
@@ -452,7 +457,7 @@ SEASTAR_TEST_CASE(broken_ranges_collection) {
         return repeat([s, reader] {
             return (*reader)().then([s, reader] (mutation_opt mut) {
                 auto key_equal = [s, &mut] (sstring ip) {
-                    return mut->key().representation() == partition_key::from_deeply_exploded(*s, { net::ipv4_address(ip) }).representation();
+                    return mut->key().equal(*s, partition_key::from_deeply_exploded(*s, { net::ipv4_address(ip) }));
                 };
 
                 if (!mut) {

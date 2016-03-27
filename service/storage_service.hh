@@ -57,7 +57,7 @@
 #include "streaming/stream_state.hh"
 #include "streaming/stream_plan.hh"
 #include <seastar/core/distributed.hh>
-#include <seastar/core/rwlock.hh>
+#include "disk-error-handler.hh"
 
 namespace transport {
     class cql_server;
@@ -77,6 +77,9 @@ inline storage_service& get_local_storage_service() {
     return _the_storage_service.local();
 }
 
+int get_generation_number();
+
+enum class disk_error { regular, commit };
 
 /**
  * This abstraction contains the token/identifier of this node
@@ -84,7 +87,7 @@ inline storage_service& get_local_storage_service() {
  * This class will also maintain histograms of the load information
  * of other nodes in the cluster.
  */
-class storage_service : public gms::i_endpoint_state_change_subscriber, public seastar::async_sharded_service<storage_service> {
+class storage_service : public service::migration_listener, public gms::i_endpoint_state_change_subscriber, public seastar::async_sharded_service<storage_service> {
 public:
     struct snapshot_details {
         int64_t live;
@@ -108,6 +111,7 @@ private:
     private final AtomicLong notificationSerialNumber = new AtomicLong();
 #endif
     distributed<database>& _db;
+    int _update_jobs{0};
     // Note that this is obviously only valid for the current shard. Users of
     // this facility should elect a shard to be the coordinator based on any
     // given objective criteria
@@ -118,14 +122,34 @@ private:
     shared_ptr<load_broadcaster> _lb;
     shared_ptr<distributed<transport::cql_server>> _cql_server;
     shared_ptr<distributed<thrift_server>> _thrift_server;
-    rwlock _api_lock;
+    sstring _operation_in_progress;
+    bool _ms_stopped = false;
 public:
     storage_service(distributed<database>& db)
         : _db(db) {
+        sstable_read_error.connect([this] { isolate_on_error(); });
+        sstable_write_error.connect([this] { isolate_on_error(); });
+        general_disk_error.connect([this] { isolate_on_error(); });
+        commit_error.connect([this] { isolate_on_commit_error(); });
     }
+    void isolate_on_error() {
+        do_isolate_on_error(disk_error::regular);
+    };
+    void isolate_on_commit_error() {
+        do_isolate_on_error(disk_error::commit);
+    };
 
     // Needed by distributed<>
     future<> stop();
+    void init_messaging_service();
+    void uninit_messaging_service();
+
+private:
+    void do_update_pending_ranges();
+
+public:
+    future<> keyspace_changed(const sstring& ks_name);
+    future<> update_pending_ranges();
 
     const locator::token_metadata& get_token_metadata() const {
         return _token_metadata;
@@ -144,9 +168,6 @@ public:
         return _db;
     }
 
-    rwlock& api_lock() {
-        return _api_lock;
-    };
 private:
     bool is_auto_bootstrap();
     inet_address get_broadcast_address() const {
@@ -154,6 +175,7 @@ private:
     }
     /* This abstraction maintains the token/endpoint metadata information */
     token_metadata _token_metadata;
+    token_metadata _shadow_token_metadata;
 public:
     std::chrono::milliseconds get_ring_delay();
     gms::versioned_value::factory value_factory;
@@ -288,6 +310,7 @@ public:
 private:
     future<> do_stop_rpc_server();
     future<> do_stop_native_transport();
+    future<> do_stop_ms();
 #if 0
     public void stopTransports()
     {
@@ -355,6 +378,10 @@ public:
     }
 
     future<> init_server(int delay);
+
+    future<> drain_on_shutdown();
+
+    void flush_column_families();
 #if 0
     /**
      * In the event of forceful termination we need to remove the shutdown hook to prevent hanging (OOM for instance)
@@ -695,6 +722,26 @@ public:
     virtual void on_dead(gms::inet_address endpoint, gms::endpoint_state state) override;
     virtual void on_remove(gms::inet_address endpoint) override;
     virtual void on_restart(gms::inet_address endpoint, gms::endpoint_state state) override;
+
+public:
+    // For migration_listener
+    virtual void on_create_keyspace(const sstring& ks_name) override { keyspace_changed(ks_name).get(); }
+    virtual void on_create_column_family(const sstring& ks_name, const sstring& cf_name) override {}
+    virtual void on_create_user_type(const sstring& ks_name, const sstring& type_name) override {}
+    virtual void on_create_function(const sstring& ks_name, const sstring& function_name) override {}
+    virtual void on_create_aggregate(const sstring& ks_name, const sstring& aggregate_name) override {}
+
+    virtual void on_update_keyspace(const sstring& ks_name) override { keyspace_changed(ks_name).get(); }
+    virtual void on_update_column_family(const sstring& ks_name, const sstring& cf_name, bool) override {}
+    virtual void on_update_user_type(const sstring& ks_name, const sstring& type_name) override {}
+    virtual void on_update_function(const sstring& ks_name, const sstring& function_name) override {}
+    virtual void on_update_aggregate(const sstring& ks_name, const sstring& aggregate_name) override {}
+
+    virtual void on_drop_keyspace(const sstring& ks_name) override { keyspace_changed(ks_name).get(); }
+    virtual void on_drop_column_family(const sstring& ks_name, const sstring& cf_name) override {}
+    virtual void on_drop_user_type(const sstring& ks_name, const sstring& type_name) override {}
+    virtual void on_drop_function(const sstring& ks_name, const sstring& function_name) override {}
+    virtual void on_drop_aggregate(const sstring& ks_name, const sstring& aggregate_name) override {}
 private:
     void update_peer_info(inet_address endpoint);
     void do_update_system_peers_table(gms::inet_address endpoint, const application_state& state, const versioned_value& value);
@@ -703,6 +750,30 @@ private:
     future<> replicate_to_all_cores();
     semaphore _replicate_task{1};
 private:
+    /**
+     * Replicates token_metadata contents on shard0 instance to other shards.
+     *
+     * Should be called with a _replicate_task semaphore taken.
+     * Should run on shard 0 only.
+     *
+     * @return a ready future when replication is complete.
+     */
+    future<> replicate_tm_only();
+
+    /**
+     * Replicates token_metadata and gossiper::endpoint_state_map contents on
+     * shard0 instances to other shards.
+     *
+     * Should be called with a _replicate_task and a gossiper::timer_callback
+     * semaphores taken.
+     * Should run on shard 0 only.
+     *
+     * @param g0 a "shared_from_this()" pointer to a gossiper instance on shard0
+     *
+     * @return a ready future when replication is complete.
+     */
+    future<> replicate_tm_and_ep_map(shared_ptr<gms::gossiper> g0);
+
     /**
      * Handle node bootstrap
      *
@@ -838,6 +909,9 @@ public:
     sstring get_release_version();
 
     sstring get_schema_version();
+
+    future<std::unordered_map<sstring, std::vector<sstring>>> describe_schema_versions();
+
 #if 0
     public List<String> getLeavingNodes()
     {
@@ -1605,6 +1679,7 @@ public:
 #endif
     /**
      * Get all ranges an endpoint is responsible for (by keyspace)
+     * Replication strategy's get_ranges() guarantees that no wrap-around range is returned.
      * @param ep endpoint we are interested in.
      * @return ranges for the specified endpoint.
      */
@@ -2284,19 +2359,15 @@ public:
 #endif
 
     template <typename Func>
-    inline auto run_with_write_api_lock(Func&& func) {
-        return get_storage_service().invoke_on(0, [func = std::forward<Func>(func)] (storage_service& ss) mutable {
-            return with_lock(ss.api_lock().for_write(), [&ss, func = std::forward<Func>(func)] () mutable {
-                return func(ss);
-            });
-        });
-    }
-
-    template <typename Func>
-    inline auto run_with_read_api_lock(Func&& func) {
-        return get_storage_service().invoke_on(0, [func = std::forward<Func>(func)] (storage_service& ss) mutable {
-            return with_lock(ss.api_lock().for_read(), [&ss, func = std::forward<Func>(func)] () mutable {
-                return func(ss);
+    inline auto run_with_api_lock(sstring operation, Func&& func) {
+        return get_storage_service().invoke_on(0, [operation = std::move(operation),
+                func = std::forward<Func>(func)] (storage_service& ss) mutable {
+            if (!ss._operation_in_progress.empty()) {
+                throw std::runtime_error(sprint("Operation %s is in progress, try again", ss._operation_in_progress));
+            }
+            ss._operation_in_progress = std::move(operation);
+            return func(ss).finally([&ss] {
+                ss._operation_in_progress = sstring();
             });
         });
     }
@@ -2307,6 +2378,8 @@ public:
             return func(ss);
         });
     }
+private:
+    void do_isolate_on_error(disk_error type);
 };
 
 inline future<> init_storage_service(distributed<database>& db) {

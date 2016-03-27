@@ -20,6 +20,7 @@
  */
 
 #include "mutation.hh"
+#include "query-result-writer.hh"
 
 mutation::data::data(dht::decorated_key&& key, schema_ptr&& schema)
     : _schema(std::move(schema))
@@ -126,8 +127,10 @@ bool mutation::operator!=(const mutation& m) const {
 }
 
 query::result
-mutation::query(const query::partition_slice& slice, gc_clock::time_point now, uint32_t row_limit) const {
-    query::result::builder builder(slice);
+mutation::query(const query::partition_slice& slice, query::result_request request,
+    gc_clock::time_point now, uint32_t row_limit) const
+{
+    query::result::builder builder(slice, request);
     auto pb = builder.add_partition(*schema(), key());
     partition().query(pb, *schema(), now, row_limit);
     return builder.build();
@@ -182,4 +185,8 @@ void mutation::apply(mutation&& m) {
 
 void mutation::apply(const mutation& m) {
     partition().apply(*schema(), m.partition(), *m.schema());
+}
+
+mutation& mutation::operator=(const mutation& m) {
+    return *this = mutation(m);
 }

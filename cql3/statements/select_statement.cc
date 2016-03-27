@@ -117,6 +117,11 @@ select_statement::for_selection(schema_ptr schema, ::shared_ptr<selection::selec
         ::shared_ptr<term>{});
 }
 
+::shared_ptr<cql3::metadata> select_statement::get_result_metadata() const {
+    // FIXME: COUNT needs special result metadata handling.
+    return _selection->get_result_metadata();
+}
+
 uint32_t select_statement::get_bound_terms() {
     return _bound_terms;
 }
@@ -170,7 +175,7 @@ select_statement::make_partition_slice(const query_options& options) {
     if (_parameters->is_distinct()) {
         _opts.set(query::partition_slice::option::distinct);
         return query::partition_slice({ query::clustering_range::make_open_ended_both_sides() },
-            std::move(static_columns), {}, _opts);
+            std::move(static_columns), {}, _opts, nullptr, options.get_cql_serialization_format());
     }
 
     auto bounds = _restrictions->get_clustering_bounds(options);
@@ -179,7 +184,7 @@ select_statement::make_partition_slice(const query_options& options) {
         std::reverse(bounds.begin(), bounds.end());
     }
     return query::partition_slice(std::move(bounds),
-        std::move(static_columns), std::move(regular_columns), _opts);
+        std::move(static_columns), std::move(regular_columns), _opts, nullptr, options.get_cql_serialization_format());
 }
 
 int32_t select_statement::get_limit(const query_options& options) const {
@@ -246,7 +251,7 @@ select_statement::execute(distributed<service::storage_proxy>& proxy, service::q
     if (aggregate) {
         return do_with(
                 cql3::selection::result_set_builder(*_selection, now,
-                        options.get_serialization_format()),
+                        options.get_cql_serialization_format()),
                 [p, page_size, now](auto& builder) {
                     return do_until([p] {return p->is_exhausted();},
                             [p, &builder, page_size, now] {
@@ -338,8 +343,8 @@ shared_ptr<transport::messages::result_message> select_statement::process_result
         db_clock::time_point now) {
 
     cql3::selection::result_set_builder builder(*_selection, now,
-            options.get_serialization_format());
-    query::result_view::consume(results->buf(), cmd->slice,
+            options.get_cql_serialization_format());
+    query::result_view::consume(*results, cmd->slice,
             cql3::selection::result_set_builder::visitor(builder, *_schema,
                     *_selection));
     auto rs = builder.build();
@@ -529,9 +534,12 @@ select_statement::raw_statement::get_ordering_comparator(schema_ptr schema,
 }
 
 bool select_statement::raw_statement::is_reversed(schema_ptr schema) {
-    std::experimental::optional<bool> reversed_map[schema->clustering_key_size()];
 
-    uint32_t i = 0;
+    assert(_parameters->orderings().size() > 0);
+    parameters::orderings_type::size_type i = 0;
+    bool is_reversed_ = false;
+    bool relation_order_unsupported = false;
+
     for (auto&& e : _parameters->orderings()) {
         ::shared_ptr<column_identifier> column = e.first->prepare_column_identifier(schema);
         bool reversed = e.second;
@@ -551,32 +559,23 @@ bool select_statement::raw_statement::is_reversed(schema_ptr schema) {
                 "Order by currently only support the ordering of columns following their declared order in the PRIMARY KEY");
         }
 
-        reversed_map[i] = std::experimental::make_optional(reversed != def->type->is_reversed());
+        bool current_reverse_status = (reversed != def->type->is_reversed());
+
+        if (i == 0) {
+            is_reversed_ = current_reverse_status;
+        }
+
+        if (is_reversed_ != current_reverse_status) {
+            relation_order_unsupported = true;
+        }
         ++i;
     }
 
-    // GCC incorrenctly complains about "*is_reversed_" below
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
-
-    // Check that all bool in reversedMap, if set, agrees
-    std::experimental::optional<bool> is_reversed_{};
-    for (auto&& b : reversed_map) {
-        if (b) {
-            if (!is_reversed_) {
-                is_reversed_ = b;
-            } else {
-                if ((*is_reversed_) != *b) {
-                    throw exceptions::invalid_request_exception("Unsupported order by relation");
-                }
-            }
-        }
+    if (relation_order_unsupported) {
+        throw exceptions::invalid_request_exception("Unsupported order by relation");
     }
 
-    assert(is_reversed_);
-    return *is_reversed_;
-
-#pragma GCC diagnostic pop
+    return is_reversed_;
 }
 
 /** If ALLOW FILTERING was not specified, this verifies that it is not needed */

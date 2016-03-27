@@ -43,6 +43,7 @@
 #include "query_pager.hh"
 #include "cql3/selection/selection.hh"
 #include "log.hh"
+#include "to_string.hh"
 
 static logging::logger logger("paging");
 
@@ -79,7 +80,7 @@ private:
 
             auto reversed = _cmd->slice.options.contains<query::partition_slice::option::reversed>();
 
-            logger.trace("PKey={}, CKey={}, reversed={}", dpk, *_last_ckey, reversed);
+            logger.trace("PKey={}, CKey={}, reversed={}", dpk, _last_ckey, reversed);
 
             // Note: we're assuming both that the ranges are checked
             // and "cql-compliant", and that storage_proxy will process
@@ -176,7 +177,7 @@ private:
             db_clock::time_point now) override {
         return do_with(
                 cql3::selection::result_set_builder(*_selection, now,
-                        _options.get_serialization_format()),
+                        _options.get_cql_serialization_format()),
                 [this, page_size, now](auto& builder) {
                     return this->fetch_page(builder, page_size, now).then([&builder] {
                        return builder.build();
@@ -280,7 +281,7 @@ private:
         };
 
         myvisitor v(*this, std::min(page_size, _max), builder, *_schema, *_selection);
-        query::result_view::consume(results->buf(), _cmd->slice, v);
+        query::result_view::consume(*results, _cmd->slice, v);
 
         if (_last_pkey) {
             // refs #752, when doing aggregate queries we will re-use same

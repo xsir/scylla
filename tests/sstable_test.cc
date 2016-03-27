@@ -36,6 +36,12 @@
 #include "database.hh"
 #include <memory>
 #include "sstable_test.hh"
+#include "tmpdir.hh"
+
+#include "disk-error-handler.hh"
+
+thread_local disk_error_signal_type commit_error;
+thread_local disk_error_signal_type general_disk_error;
 
 using namespace sstables;
 
@@ -169,10 +175,11 @@ SEASTAR_TEST_CASE(big_summary_query_32) {
     return summary_query<32, 0xc4000, 182>("tests/sstables/bigsummary", 76);
 }
 
-static future<sstable_ptr> do_write_sst(sstring dir, unsigned long generation) {
-    auto sst = make_lw_shared<sstable>("ks", "cf", dir, generation, la, big);
-    return sst->load().then([sst, generation] {
+static future<sstable_ptr> do_write_sst(sstring load_dir, sstring write_dir, unsigned long generation) {
+    auto sst = make_lw_shared<sstable>("ks", "cf", load_dir, generation, la, big);
+    return sst->load().then([sst, write_dir, generation] {
         sstables::test(sst).change_generation_number(generation + 1);
+        sstables::test(sst).change_dir(write_dir);
         auto fut = sstables::test(sst).store();
         return std::move(fut).then([sst = std::move(sst)] {
             return make_ready_future<sstable_ptr>(std::move(sst));
@@ -180,8 +187,8 @@ static future<sstable_ptr> do_write_sst(sstring dir, unsigned long generation) {
     });
 }
 
-static future<> write_sst_info(sstring dir, unsigned long generation) {
-    return do_write_sst(dir, generation).then([] (auto ptr) { return make_ready_future<>(); });
+static future<> write_sst_info(sstring load_dir, sstring write_dir, unsigned long generation) {
+    return do_write_sst(load_dir, write_dir, generation).then([] (auto ptr) { return make_ready_future<>(); });
 }
 
 using bufptr_t = std::unique_ptr<char [], free_deleter>;
@@ -223,11 +230,12 @@ static future<> compare_files(sstdesc file1, sstdesc file2, sstable::component_t
 }
 
 static future<> check_component_integrity(sstable::component_type component) {
-    return write_sst_info("tests/sstables/compressed", 1).then([component] {
+    auto tmp = make_lw_shared<tmpdir>();
+    return write_sst_info("tests/sstables/compressed", tmp->path, 1).then([component, tmp] {
         return compare_files(sstdesc{"tests/sstables/compressed", 1 },
-                             sstdesc{"tests/sstables/compressed", 2 },
+                             sstdesc{tmp->path, 2 },
                              component);
-    });
+    }).then([tmp] {});
 }
 
 SEASTAR_TEST_CASE(check_compressed_info_func) {
@@ -235,8 +243,9 @@ SEASTAR_TEST_CASE(check_compressed_info_func) {
 }
 
 SEASTAR_TEST_CASE(check_summary_func) {
-    return do_write_sst("tests/sstables/compressed", 1).then([] (auto sst1) {
-        auto sst2 = make_lw_shared<sstable>("ks", "cf", "tests/sstables/compressed", 2, la, big);
+    auto tmp = make_lw_shared<tmpdir>();
+    return do_write_sst("tests/sstables/compressed", tmp->path, 1).then([tmp] (auto sst1) {
+        auto sst2 = make_lw_shared<sstable>("ks", "cf", tmp->path, 2, la, big);
         return sstables::test(sst2).read_summary().then([sst1, sst2] {
             summary& sst1_s = sstables::test(sst1).get_summary();
             summary& sst2_s = sstables::test(sst2).get_summary();
@@ -247,7 +256,7 @@ SEASTAR_TEST_CASE(check_summary_func) {
             BOOST_REQUIRE(sst1_s.first_key.value == sst2_s.first_key.value);
             BOOST_REQUIRE(sst1_s.last_key.value == sst2_s.last_key.value);
         });
-    });
+    }).then([tmp] {});
 }
 
 SEASTAR_TEST_CASE(check_filter_func) {
@@ -255,8 +264,9 @@ SEASTAR_TEST_CASE(check_filter_func) {
 }
 
 SEASTAR_TEST_CASE(check_statistics_func) {
-    return do_write_sst("tests/sstables/compressed", 1).then([] (auto sst1) {
-        auto sst2 = make_lw_shared<sstable>("ks", "cf", "tests/sstables/compressed", 2, la, big);
+    auto tmp = make_lw_shared<tmpdir>();
+    return do_write_sst("tests/sstables/compressed", tmp->path, 1).then([tmp] (auto sst1) {
+        auto sst2 = make_lw_shared<sstable>("ks", "cf", tmp->path, 2, la, big);
         return sstables::test(sst2).read_statistics().then([sst1, sst2] {
             statistics& sst1_s = sstables::test(sst1).get_statistics();
             statistics& sst2_s = sstables::test(sst2).get_statistics();
@@ -271,19 +281,20 @@ SEASTAR_TEST_CASE(check_statistics_func) {
             });
             // TODO: compare the field contents from both sstables.
         });
-    });
+    }).then([tmp] {});
 }
 
 SEASTAR_TEST_CASE(check_toc_func) {
-    return do_write_sst("tests/sstables/compressed", 1).then([] (auto sst1) {
-        auto sst2 = make_lw_shared<sstable>("ks", "cf", "tests/sstables/compressed", 2, la, big);
+    auto tmp = make_lw_shared<tmpdir>();
+    return do_write_sst("tests/sstables/compressed", tmp->path, 1).then([tmp] (auto sst1) {
+        auto sst2 = make_lw_shared<sstable>("ks", "cf", tmp->path, 2, la, big);
         return sstables::test(sst2).read_toc().then([sst1, sst2] {
             auto& sst1_c = sstables::test(sst1).get_components();
             auto& sst2_c = sstables::test(sst2).get_components();
 
             BOOST_REQUIRE(sst1_c == sst2_c);
         });
-    });
+    }).then([tmp] {});
 }
 
 SEASTAR_TEST_CASE(uncompressed_random_access_read) {
@@ -366,6 +377,9 @@ public:
     virtual proceed consume_row_end() override {
         count_row_end++;
         return proceed::yes;
+    }
+    virtual const io_priority_class& io_priority() override {
+        return default_priority_class();
     }
 };
 
@@ -461,7 +475,9 @@ public:
             sstables::deletion_time deltime) override {
         count_range_tombstone++;
     }
-
+    virtual const io_priority_class& io_priority() override {
+        return default_priority_class();
+    }
 };
 
 
@@ -852,16 +868,18 @@ SEASTAR_TEST_CASE(reshuffle) {
             cfg.enable_incremental_backups = false;
             auto cf = make_lw_shared<column_family>(uncompressed_schema(), cfg, column_family::no_commitlog(), *cm);
             cf->start();
-            return cf->reshuffle_sstables(3).then([cm, cf] (std::vector<sstables::entry_descriptor> reshuffled) {
-                BOOST_REQUIRE(reshuffled.size() == 2);
-                BOOST_REQUIRE(reshuffled[0].generation  == 3);
-                BOOST_REQUIRE(reshuffled[1].generation  == 4);
+            cf->mark_ready_for_writes();
+            std::set<int64_t> existing_sstables = { 1, 5 };
+            return cf->reshuffle_sstables(existing_sstables, 6).then([cm, cf] (std::vector<sstables::entry_descriptor> reshuffled) {
+                BOOST_REQUIRE(reshuffled.size() == 1);
+                BOOST_REQUIRE(reshuffled[0].generation  == 6);
                 return when_all(
                     test_sstable_exists("tests/sstables/generation", 1, true),
                     test_sstable_exists("tests/sstables/generation", 2, false),
-                    test_sstable_exists("tests/sstables/generation", 3, true),
-                    test_sstable_exists("tests/sstables/generation", 4, true),
-                    test_sstable_exists("tests/sstables/generation", 5, false),
+                    test_sstable_exists("tests/sstables/generation", 3, false),
+                    test_sstable_exists("tests/sstables/generation", 4, false),
+                    test_sstable_exists("tests/sstables/generation", 5, true),
+                    test_sstable_exists("tests/sstables/generation", 6, true),
                     test_sstable_exists("tests/sstables/generation", 10, false)
                 ).discard_result().then([cm] {
                     return cm->stop();

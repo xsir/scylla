@@ -25,6 +25,7 @@
 #include <seastar/core/app-template.hh>
 #include <seastar/core/thread.hh>
 
+#include "partition_slice_builder.hh"
 #include "schema_builder.hh"
 #include "memtable.hh"
 #include "row_cache.hh"
@@ -32,6 +33,11 @@
 #include "tmpdir.hh"
 #include "sstables/sstables.hh"
 #include "canonical_mutation.hh"
+
+#include "disk-error-handler.hh"
+
+thread_local disk_error_signal_type commit_error;
+thread_local disk_error_signal_type general_disk_error;
 
 class size_calculator {
     class nest {
@@ -160,6 +166,7 @@ struct sizes {
     size_t sstable;
     size_t frozen;
     size_t canonical;
+    size_t query_result;
 };
 
 static sizes calculate_sizes(const mutation& m) {
@@ -178,7 +185,8 @@ static sizes calculate_sizes(const mutation& m) {
     result.memtable = mt->occupancy().used_space();
     result.cache = tracker.region().occupancy().used_space();
     result.frozen = freeze(m).representation().size();
-    result.canonical = db::serializer<canonical_mutation>(canonical_mutation(m)).size();
+    result.canonical = canonical_mutation(m).representation().size();
+    result.query_result = m.query(partition_slice_builder(*s).build(), query::result_request::only_result).buf().size();
 
     tmpdir sstable_dir;
     auto sst = make_lw_shared<sstables::sstable>(s->ks_name(), s->cf_name(),
@@ -218,11 +226,12 @@ int main(int argc, char** argv) {
             auto sizes = calculate_sizes(m);
 
             std::cout << "mutation footprint:" << "\n";
-            std::cout << " - in cache:    " << sizes.cache << "\n";
-            std::cout << " - in memtable: " << sizes.memtable << "\n";
-            std::cout << " - in sstable:  " << sizes.sstable << "\n";
-            std::cout << " - frozen:      " << sizes.frozen << "\n";
-            std::cout << " - canonical:   " << sizes.canonical << "\n";
+            std::cout << " - in cache:     " << sizes.cache << "\n";
+            std::cout << " - in memtable:  " << sizes.memtable << "\n";
+            std::cout << " - in sstable:   " << sizes.sstable << "\n";
+            std::cout << " - frozen:       " << sizes.frozen << "\n";
+            std::cout << " - canonical:    " << sizes.canonical << "\n";
+            std::cout << " - query result: " << sizes.query_result << "\n";
 
             std::cout << "\n";
             size_calculator::print_cache_entry_size();

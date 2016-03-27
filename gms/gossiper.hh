@@ -88,8 +88,11 @@ private:
     }
     void init_messaging_service_handler();
     void uninit_messaging_service_handler();
-    future<gossip_digest_ack> handle_syn_msg(gossip_digest_syn syn_msg);
-    future<> handle_ack_msg(msg_addr id, gossip_digest_ack ack_msg);
+    future<> handle_syn_msg(msg_addr from, gossip_digest_syn syn_msg);
+    future<> handle_ack_msg(msg_addr from, gossip_digest_ack ack_msg);
+    future<> handle_ack2_msg(gossip_digest_ack2 msg);
+    future<> handle_echo_msg();
+    future<> handle_shutdown_msg(inet_address from);
     static constexpr uint32_t _default_cpuid = 0;
     msg_addr get_msg_addr(inet_address to) {
         return msg_addr{to, _default_cpuid};
@@ -99,8 +102,10 @@ private:
     bool _enabled = false;
     std::set<inet_address> _seeds_from_config;
     sstring _cluster_name;
-    future<> _callback_running = make_ready_future<>();
+    semaphore _callback_running{1};
 public:
+    future<> timer_callback_lock() { return _callback_running.wait(); }
+    void timer_callback_unlock() { _callback_running.signal(); }
     sstring get_cluster_name();
     sstring get_partitioner_name();
     inet_address get_broadcast_address() {
@@ -114,6 +119,7 @@ public:
 public:
     /* map where key is the endpoint and value is the state associated with the endpoint */
     std::unordered_map<inet_address, endpoint_state> endpoint_state_map;
+    std::unordered_map<inet_address, endpoint_state> shadow_endpoint_state_map;
 
     const std::vector<sstring> DEAD_STATES = {
         versioned_value::REMOVING_TOKEN,
@@ -197,7 +203,6 @@ private:
 
     clk::time_point _last_processed_message_at = now();
 
-    std::unordered_map<inet_address, endpoint_state> _shadow_endpoint_state_map;
     std::map<inet_address, clk::time_point> _shadow_unreachable_endpoints;
     std::set<inet_address> _shadow_live_endpoints;
 
@@ -357,10 +362,10 @@ private:
      * @param epSet   a set of endpoint from which a random endpoint is chosen.
      * @return true if the chosen endpoint is also a seed.
      */
-    future<bool> send_gossip(gossip_digest_syn message, std::set<inet_address> epset);
+    future<> send_gossip(gossip_digest_syn message, std::set<inet_address> epset);
 
     /* Sends a Gossip message to a live member and returns true if the recipient was a seed */
-    future<bool> do_gossip_to_live_member(gossip_digest_syn message);
+    future<> do_gossip_to_live_member(gossip_digest_syn message);
 
     /* Sends a Gossip message to an unreachable member */
     future<> do_gossip_to_unreachable_member(gossip_digest_syn message);
@@ -499,13 +504,15 @@ public:
     bool is_silent_shutdown_state(const endpoint_state& ep_state) const;
     void mark_as_shutdown(const inet_address& endpoint);
     void force_newer_generation();
-private:
+public:
     sstring get_gossip_status(const endpoint_state& ep_state) const;
     sstring get_gossip_status(const inet_address& endpoint) const;
 public:
     future<> wait_for_gossip_to_settle();
 private:
     uint64_t _nr_run = 0;
+    bool _ms_registered = false;
+    bool _gossiped_to_seed = false;
 };
 
 extern distributed<gossiper> _the_gossiper;

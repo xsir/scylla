@@ -61,6 +61,8 @@
 #include "db/system_keyspace.hh"
 #include "db/query_context.hh"
 #include "service/storage_service.hh"
+#include "service/priority_manager.hh"
+#include "db_clock.hh"
 
 namespace sstables {
 
@@ -71,7 +73,9 @@ class sstable_reader final : public ::mutation_reader::impl {
     mutation_reader _reader;
 public:
     sstable_reader(shared_sstable sst, schema_ptr schema)
-            : _sst(std::move(sst)), _reader(_sst->read_rows(schema)) {}
+            : _sst(std::move(sst))
+            , _reader(_sst->read_rows(schema, service::get_local_compaction_priority()))
+            {}
     virtual future<mutation_opt> operator()() override {
         return _reader.read();
     }
@@ -91,7 +95,7 @@ static api::timestamp_type get_max_purgeable_timestamp(schema_ptr schema,
 
 static bool belongs_to_current_node(const dht::token& t, const std::vector<range<dht::token>>& sorted_owned_ranges) {
     auto low = std::lower_bound(sorted_owned_ranges.begin(), sorted_owned_ranges.end(), t,
-            [] (const range<dht::token>& a, const dht::token b) {
+            [] (const range<dht::token>& a, const dht::token& b) {
         // check that range a is before token b.
         return a.after(b, dht::token_comparator());
     });
@@ -104,11 +108,22 @@ static bool belongs_to_current_node(const dht::token& t, const std::vector<range
     return false;
 }
 
+static void delete_sstables_for_interrupted_compaction(std::vector<shared_sstable>& new_sstables, sstring& ks, sstring& cf) {
+    // Delete either partially or fully written sstables of a compaction that
+    // was either stopped abruptly (e.g. out of disk space) or deliberately
+    // (e.g. nodetool stop COMPACTION).
+    for (auto& sst : new_sstables) {
+        logger.debug("Deleting sstable {} of interrupted compaction for {}.{}", sst->get_filename(), ks, cf);
+        sst->mark_for_deletion();
+    }
+}
+
 // compact_sstables compacts the given list of sstables creating one
 // (currently) or more (in the future) new sstables. The new sstables
 // are created using the "sstable_creator" object passed by the caller.
-future<> compact_sstables(std::vector<shared_sstable> sstables, column_family& cf, std::function<shared_sstable()> creator,
-                          uint64_t max_sstable_size, uint32_t sstable_level, bool cleanup) {
+future<std::vector<shared_sstable>>
+compact_sstables(std::vector<shared_sstable> sstables, column_family& cf, std::function<shared_sstable()> creator,
+                 uint64_t max_sstable_size, uint32_t sstable_level, bool cleanup) {
     std::vector<::mutation_reader> readers;
     uint64_t estimated_partitions = 0;
     auto ancestors = make_lw_shared<std::vector<unsigned long>>();
@@ -209,23 +224,11 @@ future<> compact_sstables(std::vector<shared_sstable> sstables, column_family& c
     std::vector<range<dht::token>> owned_ranges;
     if (cleanup) {
         owned_ranges = service::get_local_storage_service().get_local_ranges(schema->ks_name());
-        // sort owned ranges
-        std::sort(owned_ranges.begin(), owned_ranges.end(), [](range<dht::token>& a, range<dht::token>& b) {
-            if (!a.start()) {
-                return true;
-            }
-            if (!b.start()) {
-                return false;
-            }
-            const dht::token& a_start = a.start()->value();
-            const dht::token& b_start = b.start()->value();
-            return a_start < b_start;
-        });
     }
     auto reader = make_mutation_reader<compacting_reader>(schema, std::move(readers), std::move(not_compacted_sstables),
         std::move(owned_ranges), cleanup);
 
-    auto start_time = std::chrono::steady_clock::now();
+    auto start_time = db_clock::now();
 
     // We use a fixed-sized pipe between the producer fiber (which reads the
     // individual sstables and merges them) and the consumer fiber (which
@@ -243,7 +246,7 @@ future<> compact_sstables(std::vector<shared_sstable> sstables, column_family& c
     future<> read_done = repeat([output_writer, reader = std::move(reader), info] () mutable {
         if (info->is_stop_requested()) {
             // Compaction manager will catch this exception and re-schedule the compaction.
-            throw std::runtime_error(sprint("Compaction for %s/%s was deliberately stopped.", info->ks, info->cf));
+            throw compaction_stop_exception(info->ks, info->cf, info->stop_requested);
         }
         return reader().then([output_writer, info] (auto mopt) {
             if (mopt) {
@@ -281,6 +284,7 @@ future<> compact_sstables(std::vector<shared_sstable> sstables, column_family& c
             output_reader->unread(std::move(*mut));
 
             auto newtab = creator();
+            info->new_sstables.push_back(newtab);
             newtab->get_metadata_collector().set_replay_position(rp);
             newtab->get_metadata_collector().sstable_level(sstable_level);
             for (auto ancestor : *ancestors) {
@@ -289,9 +293,9 @@ future<> compact_sstables(std::vector<shared_sstable> sstables, column_family& c
 
             ::mutation_reader mutation_queue_reader = make_mutation_reader<queue_reader>(output_reader);
 
-            return newtab->write_components(std::move(mutation_queue_reader), partitions_per_sstable, schema, max_sstable_size, backup).then([newtab, info] {
+            auto&& priority = service::get_local_compaction_priority();
+            return newtab->write_components(std::move(mutation_queue_reader), partitions_per_sstable, schema, max_sstable_size, backup, priority).then([newtab, info] {
                 return newtab->open_data().then([newtab, info] {
-                    info->new_sstables.push_back(newtab);
                     info->end_size += newtab->data_size();
                     return make_ready_future<stop_iteration>(stop_iteration::no);
                 });
@@ -307,7 +311,13 @@ future<> compact_sstables(std::vector<shared_sstable> sstables, column_family& c
         sstring ex;
         try {
             std::get<0>(t).get();
+        } catch(compaction_stop_exception& e) {
+
+            std::get<1>(t).ignore_ready_future(); // ignore result of write fiber if compaction was asked to stop.
+            delete_sstables_for_interrupted_compaction(info->new_sstables, info->ks, info->cf);
+            throw;
         } catch(...) {
+
             ex += sprint("read exception: %s", std::current_exception());
         }
 
@@ -318,11 +328,13 @@ future<> compact_sstables(std::vector<shared_sstable> sstables, column_family& c
         }
 
         if (ex.size()) {
+            delete_sstables_for_interrupted_compaction(info->new_sstables, info->ks, info->cf);
+
             throw std::runtime_error(ex);
         }
     }).then([start_time, info, cleanup] {
         double ratio = double(info->end_size) / double(info->start_size);
-        auto end_time = std::chrono::steady_clock::now();
+        auto end_time = db_clock::now();
         // time taken by compaction in seconds.
         auto duration = std::chrono::duration<float>(end_time - start_time);
         auto throughput = (double(info->end_size) / (1024*1024)) / duration.count();
@@ -363,6 +375,9 @@ future<> compact_sstables(std::vector<shared_sstable> sstables, column_family& c
         // for example, by adding a reducer method.
         return db::system_keyspace::update_compaction_history(info->ks, info->cf, compacted_at,
                 info->start_size, info->end_size, std::unordered_map<int32_t, int64_t>{});
+    }).then([info] {
+        // Return vector with newly created sstable(s).
+        return std::move(info->new_sstables);
     });
 }
 

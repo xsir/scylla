@@ -25,7 +25,6 @@
 #include "query-result.hh"
 #include "mutation_reader.hh"
 #include "frozen_mutation.hh"
-#include "db/serializer.hh"
 
 class reconcilable_result;
 class frozen_reconcilable_result;
@@ -47,6 +46,11 @@ struct partition {
     const frozen_mutation& mut() const {
         return _m;
     }
+
+    frozen_mutation& mut() {
+        return _m;
+    }
+
 
     bool operator==(const partition& other) const {
         return _row_count == other._row_count && _m.representation() == other._m.representation();

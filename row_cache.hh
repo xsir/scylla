@@ -195,10 +195,11 @@ private:
     logalloc::allocating_section _update_section;
     logalloc::allocating_section _populate_section;
     logalloc::allocating_section _read_section;
-    mutation_reader make_scanning_reader(schema_ptr, const query::partition_range&);
+    mutation_reader make_scanning_reader(schema_ptr, const query::partition_range&, const io_priority_class& pc);
     void on_hit();
     void on_miss();
     void upgrade_entry(cache_entry&);
+    void invalidate_locked(const dht::decorated_key&);
     static thread_local seastar::thread_scheduling_group _update_thread_scheduling_group;
 public:
     ~row_cache();
@@ -211,7 +212,8 @@ public:
     // User needs to ensure that the row_cache object stays alive
     // as long as the reader is used.
     // The range must not wrap around.
-    mutation_reader make_reader(schema_ptr, const query::partition_range& = query::full_partition_range);
+    mutation_reader make_reader(schema_ptr, const query::partition_range& = query::full_partition_range, const io_priority_class& = default_priority_class());
+
     const stats& stats() const { return _stats; }
 public:
     // Populate cache from given mutation. The mutation must contain all

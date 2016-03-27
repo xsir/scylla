@@ -12,24 +12,44 @@ umask 022
 console log
 
 expect stop
+respawn
+normal exit 0 1
+setuid scylla
+setgid scylla
+limit core unlimited unlimited
+limit memlock unlimited unlimited
+limit nofile 200000 200000
+limit as unlimited unlimited
+limit nproc 8096 8096
+chdir /var/lib/scylla
+env HOME=/var/lib/scylla
 
 pre-start script
-    cd /var/lib/scylla
-    . /etc/default/scylla-server
-    export NETWORK_MODE TAP BRIDGE ETHDRV ETHPCIID NR_HUGEPAGES USER GROUP SCYLLA_HOME SCYLLA_CONF SCYLLA_ARGS
-    /usr/lib/scylla/scylla_prepare
+    eval "`grep -v -e "^\s*#" -e "^$" /etc/default/scylla-server|sed -e 's/^/export /'`"
+    . /etc/scylla.d/dev-mode.conf
+    . /etc/scylla.d/io.conf
+    export DEV_MODE
+    export SEASTAR_IO
+    if [ "$AMI" = "yes" ]; then
+        sudo /usr/lib/scylla/scylla-ami/scylla_ami_setup
+    fi
+    sudo /usr/lib/scylla/scylla_prepare
 end script
 
 script
-    cd /var/lib/scylla
-    . /etc/default/scylla-server
-    export NETWORK_MODE TAP BRIDGE ETHDRV ETHPCIID NR_HUGEPAGES USER GROUP SCYLLA_HOME SCYLLA_CONF SCYLLA_ARGS
-    exec /usr/lib/scylla/scylla_run
+    eval "`grep -v -e "^\s*#" -e "^$" /etc/default/scylla-server|sed -e 's/^/export /'`"
+    . /etc/scylla.d/dev-mode.conf
+    . /etc/scylla.d/io.conf
+    export DEV_MODE
+    export SEASTAR_IO
+    exec /usr/bin/scylla $SCYLLA_ARGS $SEASTAR_IO $DEV_MODE
 end script
 
 post-stop script
-    cd /var/lib/scylla
-    . /etc/default/scylla-server
-    export NETWORK_MODE TAP BRIDGE ETHDRV ETHPCIID NR_HUGEPAGES USER GROUP SCYLLA_HOME SCYLLA_CONF SCYLLA_ARGS
-    /usr/lib/scylla/scylla_stop
+    eval "`grep -v -e "^\s*#" -e "^$" /etc/default/scylla-server|sed -e 's/^/export /'`"
+    . /etc/scylla.d/dev-mode.conf
+    . /etc/scylla.d/io.conf
+    export DEV_MODE
+    export SEASTAR_IO
+    sudo /usr/lib/scylla/scylla_stop
 end script

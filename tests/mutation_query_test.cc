@@ -38,6 +38,11 @@
 #include "schema_builder.hh"
 #include "partition_slice_builder.hh"
 
+#include "disk-error-handler.hh"
+
+thread_local disk_error_signal_type commit_error;
+thread_local disk_error_signal_type general_disk_error;
+
 using namespace std::literals::chrono_literals;
 
 static schema_ptr make_schema() {
@@ -59,13 +64,13 @@ struct mutation_less_cmp {
 };
 
 mutation_source make_source(std::vector<mutation> mutations) {
-    return [mutations = std::move(mutations)] (schema_ptr s, const query::partition_range& range) {
+    return mutation_source([mutations = std::move(mutations)] (schema_ptr s, const query::partition_range& range) {
         assert(range.is_full()); // slicing not implemented yet
         for (auto&& m : mutations) {
             assert(m.schema() == s);
         }
         return make_reader_returning_many(mutations);
-    };
+    });
 }
 
 static query::partition_slice make_full_slice(const schema& s) {
@@ -388,5 +393,54 @@ SEASTAR_TEST_CASE(test_query_when_partition_tombstone_covers_live_cells) {
 
         assert_that(to_result_set(result, s, slice))
             .is_empty();
+    });
+}
+
+SEASTAR_TEST_CASE(test_partitions_with_only_expired_tombstones_are_dropped) {
+    return seastar::async([] {
+        auto s = schema_builder("ks", "cf")
+            .with_column("pk", bytes_type, column_kind::partition_key)
+            .with_column("v", bytes_type, column_kind::regular_column)
+            .set_gc_grace_seconds(0)
+            .build();
+
+        auto now = gc_clock::now();
+
+        auto new_key = [s] {
+            static int ctr = 0;
+            return partition_key::from_singular(*s, data_value(to_bytes(sprint("key%d", ctr++))));
+        };
+
+        auto make_ring = [&] (int n) {
+            std::vector<mutation> ring;
+            while (n--) {
+                ring.push_back(mutation(new_key(), s));
+            }
+            std::sort(ring.begin(), ring.end(), mutation_decorated_key_less_comparator());
+            return ring;
+        };
+
+        std::vector<mutation> ring = make_ring(4);
+
+        ring[0].set_clustered_cell(clustering_key::make_empty(*s), "v", data_value(bytes("v")), api::new_timestamp());
+
+        {
+            auto ts = api::new_timestamp();
+            ring[1].partition().apply(tombstone(ts, now));
+            ring[1].set_clustered_cell(clustering_key::make_empty(*s), "v", data_value(bytes("v")), ts);
+        }
+
+        ring[2].partition().apply(tombstone(api::new_timestamp(), now));
+        ring[3].set_clustered_cell(clustering_key::make_empty(*s), "v", data_value(bytes("v")), api::new_timestamp());
+
+        auto src = make_source(ring);
+        auto slice = make_full_slice(*s);
+
+        auto query_time = now + std::chrono::seconds(1);
+
+        reconcilable_result result = mutation_query(s, src, query::full_partition_range, slice, query::max_rows, query_time).get0();
+
+        BOOST_REQUIRE_EQUAL(result.partitions().size(), 2);
+        BOOST_REQUIRE_EQUAL(result.row_count(), 2);
     });
 }

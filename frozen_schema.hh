@@ -23,31 +23,19 @@
 
 #include "query-result.hh"
 #include "schema.hh"
-#include "db/serializer.hh"
 #include "frozen_mutation.hh"
 
 // Transport for schema_ptr across shards/nodes.
 // It's safe to access from another shard by const&.
 class frozen_schema {
     bytes _data;
-private:
-    frozen_schema(bytes);
 public:
+    explicit frozen_schema(bytes);
     frozen_schema(const schema_ptr&);
     frozen_schema(frozen_schema&&) = default;
     frozen_schema(const frozen_schema&) = default;
     frozen_schema& operator=(const frozen_schema&) = default;
     frozen_schema& operator=(frozen_schema&&) = default;
     schema_ptr unfreeze() const;
-    friend class db::serializer<frozen_schema>;
+    bytes_view representation() const;
 };
-
-namespace db {
-
-template<> serializer<frozen_schema>::serializer(const frozen_schema&);
-template<> void serializer<frozen_schema>::write(output&, const frozen_schema&);
-template<> frozen_schema serializer<frozen_schema>::read(input&);
-
-extern template class serializer<frozen_schema>;
-
-}

@@ -24,6 +24,11 @@
 #include "tests/perf/perf.hh"
 #include "core/app-template.hh"
 
+#include "disk-error-handler.hh"
+
+thread_local disk_error_signal_type commit_error;
+thread_local disk_error_signal_type general_disk_error;
+
 static const sstring table_name = "cf";
 
 static bytes make_key(uint64_t sequence) {
@@ -50,6 +55,7 @@ struct test_config {
     unsigned partitions;
     unsigned concurrency;
     bool query_single_key;
+    unsigned duration_in_seconds;
 };
 
 std::ostream& operator<<(std::ostream& os, const test_config::run_mode& m) {
@@ -79,7 +85,7 @@ future<> test_read(cql_test_env& env, test_config& cfg) {
         return time_parallel([&env, &cfg, id] {
             bytes key = make_key(cfg.query_single_key ? 0 : std::rand() % cfg.partitions);
             return env.execute_prepared(id, {{std::move(key)}}).discard_result();
-        }, cfg.concurrency);
+        }, cfg.concurrency, cfg.duration_in_seconds);
     });
 }
 
@@ -95,7 +101,7 @@ future<> test_write(cql_test_env& env, test_config& cfg) {
             return time_parallel([&env, &cfg, id] {
                 bytes key = make_key(cfg.query_single_key ? 0 : std::rand() % cfg.partitions);
                 return env.execute_prepared(id, {{std::move(key)}}).discard_result();
-            }, cfg.concurrency);
+            }, cfg.concurrency, cfg.duration_in_seconds);
         });
 }
 
@@ -125,21 +131,19 @@ int main(int argc, char** argv) {
     app.add_options()
         ("partitions", bpo::value<unsigned>()->default_value(10000), "number of partitions")
         ("write", "test write path instead of read path")
+        ("duration", bpo::value<unsigned>()->default_value(5), "test duration in seconds")
         ("query-single-key", "test write path instead of read path")
         ("concurrency", bpo::value<unsigned>()->default_value(100), "workers per core");
 
-    return app.run_deprecated(argc, argv, [&app] {
-        make_env_for_test().then([&app] (auto env) {
+    return app.run(argc, argv, [&app] {
+        return do_with_cql_env([&app] (auto&& env) {
             auto cfg = make_lw_shared<test_config>();
             cfg->partitions = app.configuration()["partitions"].as<unsigned>();
+            cfg->duration_in_seconds = app.configuration()["duration"].as<unsigned>();
             cfg->concurrency = app.configuration()["concurrency"].as<unsigned>();
             cfg->mode = app.configuration().count("write") ? test_config::run_mode::write : test_config::run_mode::read;
             cfg->query_single_key = app.configuration().count("query-single-key");
-            return do_test(*env, *cfg).finally([env, cfg] {
-                return env->stop().finally([env] {});
-            });
-        }).then([] {
-            return engine().exit(0);
-        }).or_terminate();
+            return do_test(env, *cfg).finally([cfg] {});
+        });
     });
 }

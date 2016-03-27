@@ -987,6 +987,7 @@ SEASTAR_TEST_CASE(compaction_manager_test) {
     cfg.enable_incremental_backups = false;
     auto cf = make_lw_shared<column_family>(s, cfg, column_family::no_commitlog(), *cm);
     cf->start();
+    cf->mark_ready_for_writes();
     cf->set_compaction_strategy(sstables::compaction_strategy_type::size_tiered);
 
     auto generations = make_lw_shared<std::vector<unsigned long>>({1, 2, 3, 4});
@@ -1019,7 +1020,7 @@ SEASTAR_TEST_CASE(compaction_manager_test) {
         // were compacted.
 
         BOOST_REQUIRE(cf->sstables_count() == generations->size());
-        cm->submit(&*cf);
+        cf->trigger_compaction();
         BOOST_REQUIRE(cm->get_stats().pending_tasks == 1);
 
         // wait for submitted job to finish.
@@ -1063,6 +1064,7 @@ SEASTAR_TEST_CASE(compact) {
     auto s = builder.build();
     auto cm = make_lw_shared<compaction_manager>();
     auto cf = make_lw_shared<column_family>(s, column_family::config(), column_family::no_commitlog(), *cm);
+    cf->mark_ready_for_writes();
 
     return open_sstables("tests/sstables/compaction", {1,2,3}).then([s = std::move(s), cf, cm, generation] (auto sstables) {
         return test_setup::do_with_test_directory([sstables, s, generation, cf, cm] {
@@ -1070,7 +1072,7 @@ SEASTAR_TEST_CASE(compact) {
                 return make_lw_shared<sstables::sstable>("ks", "cf", "tests/sstables/tests-temporary",
                         generation, sstables::sstable::version_types::la, sstables::sstable::format_types::big);
             };
-            return sstables::compact_sstables(std::move(sstables), *cf, new_sstable, std::numeric_limits<uint64_t>::max(), 0).then([s, generation, cf, cm] {
+            return sstables::compact_sstables(std::move(sstables), *cf, new_sstable, std::numeric_limits<uint64_t>::max(), 0).then([s, generation, cf, cm] (auto) {
                 // Verify that the compacted sstable has the right content. We expect to see:
                 //  name  | age | height
                 // -------+-----+--------
@@ -1161,6 +1163,7 @@ static future<std::vector<unsigned long>> compact_sstables(std::vector<unsigned 
         {{"p1", utf8_type}}, {{"c1", utf8_type}}, {{"r1", utf8_type}}, {}, utf8_type));
     auto cm = make_lw_shared<compaction_manager>();
     auto cf = make_lw_shared<column_family>(s, column_family::config(), column_family::no_commitlog(), *cm);
+    cf->mark_ready_for_writes();
 
     auto generations = make_lw_shared<std::vector<unsigned long>>(std::move(generations_to_compact));
     auto sstables = make_lw_shared<std::vector<sstables::shared_sstable>>();
@@ -1217,7 +1220,7 @@ static future<std::vector<unsigned long>> compact_sstables(std::vector<unsigned 
             // We do expect that all candidates were selected for compaction (in this case).
             BOOST_REQUIRE(sstables_to_compact.size() == sstables->size());
             return sstables::compact_sstables(std::move(sstables_to_compact), *cf, new_sstable,
-                std::numeric_limits<uint64_t>::max(), 0).then([generation] {});
+                std::numeric_limits<uint64_t>::max(), 0).then([generation] (auto) {});
         } else if (strategy == compaction_strategy_type::leveled) {
             for (auto& sst : *sstables) {
                 BOOST_REQUIRE(sst->get_sstable_level() == 0);
@@ -1232,7 +1235,7 @@ static future<std::vector<unsigned long>> compact_sstables(std::vector<unsigned 
             BOOST_REQUIRE(candidate.max_sstable_bytes == 1024*1024);
 
             return sstables::compact_sstables(std::move(candidate.sstables), *cf, new_sstable,
-                1024*1024, candidate.level).then([generation] {});
+                1024*1024, candidate.level).then([generation] (auto) {});
         } else {
             throw std::runtime_error("unexpected strategy");
         }
@@ -1670,6 +1673,7 @@ SEASTAR_TEST_CASE(leveled_01) {
     cfg.enable_disk_writes = false;
     cfg.enable_commitlog = false;
     auto cf = make_lw_shared<column_family>(s, cfg, column_family::no_commitlog(), cm);
+    cf->mark_ready_for_writes();
 
     auto key_and_token_pair = token_generation_for_current_shard(50);
     auto min_key = key_and_token_pair[0].first;
@@ -1714,6 +1718,7 @@ SEASTAR_TEST_CASE(leveled_02) {
     cfg.enable_disk_writes = false;
     cfg.enable_commitlog = false;
     auto cf = make_lw_shared<column_family>(s, cfg, column_family::no_commitlog(), cm);
+    cf->mark_ready_for_writes();
 
     auto key_and_token_pair = token_generation_for_current_shard(50);
     auto min_key = key_and_token_pair[0].first;
@@ -1768,6 +1773,7 @@ SEASTAR_TEST_CASE(leveled_03) {
     cfg.enable_disk_writes = false;
     cfg.enable_commitlog = false;
     auto cf = make_lw_shared<column_family>(s, cfg, column_family::no_commitlog(), cm);
+    cf->mark_ready_for_writes();
 
     auto key_and_token_pair = token_generation_for_current_shard(50);
     auto min_key = key_and_token_pair[0].first;
@@ -1826,6 +1832,7 @@ SEASTAR_TEST_CASE(leveled_04) {
     cfg.enable_disk_writes = false;
     cfg.enable_commitlog = false;
     auto cf = make_lw_shared<column_family>(s, cfg, column_family::no_commitlog(), cm);
+    cf->mark_ready_for_writes();
 
     auto key_and_token_pair = token_generation_for_current_shard(50);
     auto min_key = key_and_token_pair[0].first;
@@ -2159,11 +2166,12 @@ SEASTAR_TEST_CASE(tombstone_purge_test) {
     }).then([s, tmp, sstables] {
         auto cm = make_lw_shared<compaction_manager>();
         auto cf = make_lw_shared<column_family>(s, column_family::config(), column_family::no_commitlog(), *cm);
+        cf->mark_ready_for_writes();
         auto create = [tmp] {
             return make_lw_shared<sstable>("ks", "cf", tmp->path, 3, la, big);
         };
 
-        return sstables::compact_sstables(*sstables, *cf, create, std::numeric_limits<uint64_t>::max(), 0).then([s, tmp, sstables, cf, cm] {
+        return sstables::compact_sstables(*sstables, *cf, create, std::numeric_limits<uint64_t>::max(), 0).then([s, tmp, sstables, cf, cm] (auto) {
             return open_sstable(tmp->path, 3).then([s] (shared_sstable sst) {
                 auto reader = make_lw_shared(sstable_reader(sst, s)); // reader holds sst and s alive.
                 return (*reader)().then([s, reader] (mutation_opt m) {
@@ -2259,11 +2267,12 @@ SEASTAR_TEST_CASE(sstable_rewrite) {
             };
             auto cm = make_lw_shared<compaction_manager>();
             auto cf = make_lw_shared<column_family>(s, column_family::config(), column_family::no_commitlog(), *cm);
+            cf->mark_ready_for_writes();
             std::vector<shared_sstable> sstables;
             sstables.push_back(std::move(sstp));
 
             return sstables::compact_sstables(std::move(sstables), *cf, creator,
-                    std::numeric_limits<uint64_t>::max(), 0).then([s, key, new_tables] {
+                    std::numeric_limits<uint64_t>::max(), 0).then([s, key, new_tables] (auto) {
                 BOOST_REQUIRE(new_tables->size() == 1);
                 auto newsst = (*new_tables)[0];
                 BOOST_REQUIRE(newsst->generation() == 52);
